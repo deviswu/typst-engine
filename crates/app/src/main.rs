@@ -2541,90 +2541,100 @@ impl Previewer {
             .into_any_element()
     }
 
+    /// 底部状态栏：**一行**装下引擎指标 + 文档统计 + 保存/错误 + 一次性消息 + 主题。
+    ///
+    /// 放在窗口最底部（终端面板之下）—— 与大多数编辑器一致：
+    /// 上面是「内容」，最下面一条是「状态」。
+    ///
+    /// 指标一多就必须想清楚**哪部分可以牺牲**：左侧指标放一个 `flex_1` +
+    /// `overflow_hidden` 的容器里（窄窗口下宁可裁掉几个数字），
+    /// 右侧的消息与主题下拉是**固定**的，永远看得见。
     fn render_statusbar(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
 
-        let bar = h_flex()
-            .w_full()
-            .px_3()
-            .py_1p5()
-            .gap_4()
-            .border_b_1()
-            .border_color(theme.border)
-            .text_sm()
+        let mut metrics = h_flex()
+            .gap_3()
+            .text_xs()
             .child(
                 div()
                     .text_color(theme.primary)
-                    .child(format!("排版 {:.1} ms", self.status.compile_ms)),
+                    .child(format!("排版 {:.1}ms", self.status.compile_ms)),
             )
-            .child(format!("光栅化 {:.1} ms", self.status.raster_ms))
-            .child(if self.index_builds == 0 {
-                "索引 —".to_owned()
-            } else {
-                format!("索引 {:.1} ms", self.index_ms)
-            })
+            .child(format!("光栅化 {:.1}ms", self.status.raster_ms));
+
+        if self.index_builds > 0 {
+            metrics = metrics.child(format!("索引 {:.1}ms", self.index_ms));
+        }
+
+        metrics = metrics
             .child(format!(
-                "重解析 {} B / {} B",
+                "重解析 {}B/{}B",
                 self.status.reparsed, self.status.text_bytes
             ))
             .child(format!(
-                "{:.0} MiB",
+                "{:.1}MiB",
                 self.texture_bytes as f64 / (1024.0 * 1024.0)
             ))
             .child(if self.status.pages == 0 {
                 "0 页".to_string()
             } else {
-                // 跟着滚动走 —— 滚轮翻页时这个数字会跟着变
-                format!("第 {} / {} 页", self.current_page + 1, self.status.pages)
+                format!("{}/{} 页", self.current_page + 1, self.status.pages)
             })
             .child(
                 div()
                     .text_color(theme.primary)
-                    .child(format!("缩放 {:.0}%", self.zoom * 100.0)),
+                    .child(format!("{:.0}%", self.zoom * 100.0)),
             )
             .child(format!(
-                "排版 {} 次 / 光栅化 {} 次 / 索引 {} 次",
+                "排版{}·光栅{}·索引{}",
                 self.status.compiles, self.status.rasters, self.index_builds
-            ));
-
-        // 第二行：文档信息 + 保存状态 + 一次性反馈。
-        // 拆两行是因为第一行已被引擎指标占满，再塞就只看得花。
-        let mut info = h_flex()
-            .w_full()
-            .px_3()
-            .py_1()
-            .gap_4()
-            .text_xs()
-            .text_color(theme.muted_foreground)
+            ))
             .child(self.stats.summary())
-            .child(format!("{} 个标题", self.outline.len()))
+            .child(format!("{} 标题", self.outline.len()))
             .child(if self.dirty {
                 "● 未保存"
             } else {
                 "已保存"
+            })
+            .child(if self.error_count > 0 {
+                div()
+                    .text_color(theme.danger)
+                    .child(format!("✗ {} 错误", self.error_count))
+                    .into_any_element()
+            } else {
+                div()
+                    .text_color(theme.success)
+                    .child("✓ 无错误")
+                    .into_any_element()
             });
 
-        if self.error_count > 0 {
-            info = info.child(div().text_color(theme.danger).child(format!(
-                "✗ {} 个错误（预览保留上次成功结果）",
-                self.error_count
-            )));
-        } else {
-            info = info.child(div().text_color(theme.success).child("✓ 无错误"));
-        }
+        let mut bar = h_flex()
+            .w_full()
+            .flex_shrink_0()
+            .px_3()
+            .py_1()
+            .gap_3()
+            // 贴着窗口底边，所以边框在上（原先是顶栏，边框在下）
+            .border_t_1()
+            .border_color(theme.border)
+            .text_sm()
+            .child(div().flex_1().min_w_0().overflow_hidden().child(metrics));
 
         if let Some(msg) = &self.message {
-            info = info.child(div().text_color(theme.primary).child(msg.clone()));
+            bar = bar.child(
+                div()
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(theme.primary)
+                    .child(msg.clone()),
+            );
         }
 
-        // 主题下拉框放最右（它是个交互控件，不适合夹在数字中间）
-        info = info.child(
+        bar.child(
             div()
-                .ml_auto()
-                .child(Select::new(&self.theme_select).w(px(180.))),
-        );
-
-        v_flex().w_full().child(bar).child(info)
+                .flex_shrink_0()
+                .child(Select::new(&self.theme_select).w(px(150.))),
+        )
     }
 
     /// 大纲本体（左栏的标题与边框由 `render_sidebar` 统一负责）。
@@ -2917,25 +2927,122 @@ impl Render for Previewer {
 
         let sidebar_pane = self.render_sidebar(cx);
 
-        // 工具栏：一键插入。放编辑区上方（`wu` 也是这么放的）。
-        let toolbar = h_flex()
-            .w_full()
-            .flex_shrink_0()
-            .px_2()
-            .py_1()
-            .gap_0p5()
-            .border_b_1()
-            .border_color(theme.border)
-            .children(Markup::ALL.into_iter().map(|kind| {
-                Button::new(("markup", kind as usize))
-                    .ghost()
-                    .compact()
-                    .label(kind.label())
-                    .tooltip(kind.hint())
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.apply_markup(kind, window, cx)),
-                    )
-            }));
+        // 工具栏：一键插入，分组画分隔条 —— 条目与分组都对着 `wu` 的工具栏。
+        let toolbar = {
+            let mut bar = h_flex()
+                .id("toolbar")
+                .w_full()
+                .flex_shrink_0()
+                .px_2()
+                .py_1()
+                .gap_1()
+                .items_center()
+                .border_b_1()
+                .border_color(theme.border)
+                .bg(theme.secondary)
+                // 按钮多，窄窗口里横向滚，别把按钮挤没
+                .overflow_x_scroll();
+
+            for (index, group) in Markup::GROUPS.iter().enumerate() {
+                if index > 0 {
+                    bar = bar.child(div().w(px(1.)).h(px(16.)).flex_shrink_0().bg(theme.border));
+                }
+
+                match index {
+                    // 颜色：九个颜色的下拉（wu 也是下拉）
+                    5 => {
+                        let view = cx.entity();
+                        bar = bar.child(
+                            Button::new("tb-color")
+                                .ghost()
+                                .compact()
+                                .label("颜色")
+                                .tooltip("包住选中：换这个颜色")
+                                .dropdown_menu(move |menu, window, _cx| {
+                                    let view = view.clone();
+                                    let mut menu = menu.min_w(120.);
+                                    for name in markup::COLORS {
+                                        menu = menu.item(
+                                            PopupMenuItem::new(color_label(name)).on_click(
+                                                window.listener_for(
+                                                    &view,
+                                                    move |this, _, window, cx| {
+                                                        this.apply_markup(
+                                                            Markup::TextColor(name),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    },
+                                                ),
+                                            ),
+                                        );
+                                    }
+                                    menu
+                                }),
+                        );
+                    }
+
+                    // AI：与顶部「AI」菜单同一套动作，这里再给一个入口
+                    6 => {
+                        let view = cx.entity();
+                        bar = bar.child(
+                            Button::new("tb-ai")
+                                .ghost()
+                                .compact()
+                                .label("AI")
+                                .dropdown_menu(move |menu, window, _cx| {
+                                    let view = view.clone();
+                                    let mut menu = menu.min_w(200.);
+                                    menu = menu.item(
+                                        PopupMenuItem::new("AI 编辑…（Ctrl+K）").on_click(
+                                            window.listener_for(&view, |this, _, window, cx| {
+                                                this.open_ai(window, cx)
+                                            }),
+                                        ),
+                                    );
+                                    menu = menu.separator();
+                                    for task in [
+                                        AiTask::SyntaxFix,
+                                        AiTask::Proofread,
+                                        AiTask::Terminology,
+                                        AiTask::TranslateToEnglish,
+                                        AiTask::TranslateToChinese,
+                                    ] {
+                                        menu =
+                                            menu.item(PopupMenuItem::new(task.label()).on_click(
+                                                window.listener_for(
+                                                    &view,
+                                                    move |this, _, window, cx| {
+                                                        this.run_ai_task(task, window, cx)
+                                                    },
+                                                ),
+                                            ));
+                                    }
+                                    menu
+                                }),
+                        );
+                    }
+
+                    _ => {
+                        for kind in group.iter().copied() {
+                            bar = bar.child(
+                                // id 加前缀：工具栏的「图片」与右侧页签的「图片」会撞名
+                                Button::new(format!("tb:{}", kind.label()))
+                                    .ghost()
+                                    .compact()
+                                    .label(kind.label())
+                                    .tooltip(kind.hint())
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.apply_markup(kind, window, cx)
+                                    })),
+                            );
+                        }
+                    }
+                }
+            }
+
+            bar
+        };
 
         let editor_pane = v_flex()
             .w(px(520.))
@@ -3094,7 +3201,6 @@ impl Render for Previewer {
             .size_full()
             .bg(theme.background)
             .child(self.render_menu(cx))
-            .child(self.render_statusbar(cx))
             .child(
                 h_flex()
                     .flex_1()
@@ -3105,6 +3211,8 @@ impl Render for Previewer {
                     .child(self.render_right_pane(preview_pane, cx)),
             )
             .children(self.shell_visible.then(|| self.render_shell(cx)))
+            // 状态栏贴窗口最底：上面是内容，最下面一条是状态
+            .child(self.render_statusbar(cx))
             // 浮层放在最后，才能盖在内容之上
             .children(self.quick_visible.then(|| self.render_quick_open(cx)))
             .children((self.ai.stage != AiStage::Closed).then(|| self.render_ai(cx)))
@@ -3211,6 +3319,22 @@ impl Render for Previewer {
                 };
                 this.set_zoom_anchored(next, cx);
             }))
+    }
+}
+
+/// 颜色名 → 菜单上的中文（与 `wu` 的叫法一致）。
+fn color_label(name: &str) -> &'static str {
+    match name {
+        "red" => "红",
+        "orange" => "橙",
+        "yellow" => "黄",
+        "green" => "绿",
+        "aqua" => "青",
+        "blue" => "蓝",
+        "purple" => "紫",
+        "gray" => "灰",
+        "black" => "黑",
+        _ => "颜色",
     }
 }
 

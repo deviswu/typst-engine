@@ -34,6 +34,7 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 | L10 | 界面向 `wu` 对齐：菜单条 · 目录树 · 右侧多视图（预览/Markdown/图片） | ✅ `crates/app/src/{tree,image_view,markdown_view}.rs` |
 | L11 | AI 编辑（选中文字 → Ctrl+K → 逐块 diff → 应用） | ✅ `crates/app/src/{ai,diff}.rs` + 浮层接线 |
 | L12 | 交互式终端（alacritty_terminal + PowerShell，Ctrl+4） | ✅ `crates/app/src/{terminal,terminal_view,term_colors}.rs` |
+| L13 | 工具栏补齐 `wu` 全部条目（26 按钮 + 9 色 + AI 下拉）· 状态栏合成一行贴底 | ✅ `crates/app/src/markup.rs` 扩到 29 个条目 |
 
 - 28 个 commit，8000 行 Rust（36 个 `.rs` 文件），clippy 与 `cargo fmt` 都干净
 - 远端：`github.com/deviswu/typst-engine`（public，`master`，SSH）—— `git push` 即可
@@ -116,6 +117,8 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 | 浅色主题下终端里的黄字几乎看不见 | ANSI 经典固定色是为深色底挑的 | 跟随主题换调色板 + `ensure_contrast` 只调亮度 |
 | `Button.xsmall()` 编译不过 | 这个 gpui-component rev 的 Sizable 走 `with_size(Size::Small)` | 用 `with_size` |
 | 构造里 `root` 被 `EntryState::new` 移走后再用 | `PathBuf` 不是 Copy | 重新从 `main_path.parent()` 算一次 |
+| 两个按钮用同一个 `ElementId` 会撞 | 工具栏的「图片」与右侧页签的「图片」同名 | 工具栏 id 加前缀 `tb:` |
+| 编到一半报「拒绝访问 typst-live.exe」 | 上一次 `cargo run` 的窗口还开着，文件被占 | `taskkill /F /IM typst-live.exe` 再编 |
 | 右键示例文档报波浪线 | 我写成了 Markdown 的 `**粗体**`，Typst 是 `*...*` | — |
 
 **子代理（AgentShell）在这台机器上能不能用**（2026-09-16 实测，别再重复试）：
