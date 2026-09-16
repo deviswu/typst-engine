@@ -44,10 +44,23 @@ cargo run --example realtime   # 不开窗，在终端里跑逐字输入的性�
 | L1 | 增量 World（`SourceDb` / 字体 / 包 / `impl typst::World`） | ✅ 完成 |
 | L2 | 编译驱动 | 🟡 **只做了最小版**：`success_doc` 失败保留已进引擎、「文本没变不重排」；actor 队列与防抖**刻意不做**（同步只要 0.5–2 ms，见 spec「刻意不做的事」） |
 | L3 | 导出：SVG 页 + **位图（可控 DPI / 缩放）** 已通 | 🟡 部分 |
-| L4 | 语法服务（高亮 / 大纲 / 折叠） | ⏳ Plan 3（编辑器高亮目前走 tree-sitter） |
-| L5 | GPUI 外壳（含 0.25×–4× 缩放） | ✅ `crates/app`（`typst-live`） |
+| L4 | 语法服务 | ✅ 大纲 + 波浪线（高亮仍走 tree-sitter，见下） |
+| L5 | GPUI 外壳（大纲栏 · 波浪线 · 0.25×–4× 缩放） | ✅ `crates/app`（`typst-live`） |
 
-测试：**82 个全绿**（76 单测 + 6 集成），clippy 零警告。
+测试：**106 个全绿**（92 单测 + 14 集成），clippy 零警告。
+
+### L4：做了大纲与波浪线，没做高亮（附理由）
+
+`typst_syntax::highlight()` 是现成的，但 **gpui-component 的编辑器把高亮焊死在
+tree-sitter 上**（`LanguageConfig.language` 是硬字段，`SyntaxHighlighter` 是具体结构体
+而非 trait），没有注入点。要用官方语法树着色就得 fork gpui-component —— 代价不成立。
+所以**不写没有消费方的代码**，编辑器高亮继续走 tree-sitter。
+
+交付的是有真实消费方的两样：**左侧大纲栏**，以及**编辑器的红/黄波浪线**
+（语法错误不编译就有，编译错误同样映射成一种形状）。
+
+一个真 bug 由此被测试揪出：大纲初版把「751 个标题 × 51 KB」算成了 O(n²)，
+实测 **106 ms**（一次敲键合计 116 ms，远超一帧）。改成一次性建行首索引后 **1.1 ms**。
 
 ### 预览：位图，不是 SVG
 
@@ -76,6 +89,8 @@ typst-engine/                      Cargo workspace
 │   ├── path_util.rs               就地消掉 `.` / `..`
 │   ├── export/svg.rs              页面 → SVG（导出 / 将来的页内 diff）
 │   ├── export/pixmap.rs           页面 → 位图（屏幕预览，**DPI 可控**）
+│   ├── syntax/outline.rs          文档大纲
+│   ├── syntax/diagnostic.rs       语法/编译诊断 + Span → 行列
 │   ├── vfs/                       L0：访问抽象 / 内存 / 磁盘 / 覆盖层 / Vfs+revision
 │   └── world/                     L1：QueryRef / SourceDb / EntryState / 字体 / 包 / EngineWorld
 │       ├── source_db.rs           ★ 靠 Source::replace 做增量重解析

@@ -6,5 +6,6 @@
 mod path_util;
 
 pub mod export;
+pub mod syntax;
 pub mod vfs;
 pub mod world;

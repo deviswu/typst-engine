@@ -609,9 +609,65 @@ fn render_page(page: &Page, pixel_per_pt: f32) -> Arc<Pixmap>;
 
 > 更激进的页内 SVG diff（tinymist 的 `"diff-v1 frame"`）留到 v2，先用页级粒度。
 
-### 5.5 L4 · 语法服务（`typst-syntax-svc`）
+### 5.5 L4 · 语法服务（**已落地**）
 
-只依赖 `typst-syntax`。**全部是纯函数，不持有状态、不依赖 `World`、不碰文件系统** —— 所以可以每次敲键同步跑。
+**两处与原设计的偏离，都是实测后改的：**
+
+**① 不做独立 crate，放进 `engine/src/syntax/`。**
+原设计拆 `crates/syntax-svc` 的理由是编译依赖隔离（「外壳不该为一个高亮链接排版/渲染/PDF 那一大坨」）。
+实际接线后发现这个理由不成立：**消费方必须链接 `engine` 才能拿到那棵增量维护的语法树**，
+既然 engine 已经链了，隔离收益就是零，而多一个 crate 边界只多一份需要同步的 API 表面。
+（等真出现「只要语法、不要排版」的消费方，比如一个纯 lint 工具，再拆不迟。）
+
+**② 没有 `highlight()`。**
+`typst_syntax::highlight()` 是现成的（23 个 `Tag`，官方维护），但
+**gpui-component 的编辑器把高亮焊死在 tree-sitter 上**：
+`LanguageConfig.language` 是 `tree_sitter::Language` 硬字段，`SyntaxHighlighter`
+是具体结构体（内部持 tree-sitter 树）而非 trait，`InputState` 上没有注入点。
+要用官方语法树着色就得 fork gpui-component —— 代价与收益不成比例。
+所以**不写没有消费方的代码**（同一条标准也用在「不做 `ComputeGraph`」上）。
+编辑器的高亮继续走 tree-sitter，与语法服务并存互不干扰。
+
+**实际交付的三样东西**（全部只依赖 `typst-syntax`，全是纯函数）：
+
+```rust
+/// 文档大纲。标题层级、文字、字节范围、0 起行号。
+pub fn outline(source: &Source) -> Vec<OutlineItem>;
+
+/// **不编译**就能拿到的语法错误与警告。
+pub fn syntax_diagnostics(source: &Source) -> Vec<Diagnostic>;
+
+/// 把编译诊断映射成**同样的形状**。
+pub fn compile_diagnostics(source: &Source, diags: &[SourceDiagnostic]) -> Vec<Diagnostic>;
+```
+
+**意外之喜（让 API 少了一半）**：`SyntaxDiagnostic.span` 与 `SourceDiagnostic.span`
+**是同一个类型 `DiagSpan`** —— 所以「来自解析器的错误」与「来自编译器的错误」
+共用同一份字节范围映射。对消费方意味着：画波浪线的地方只需要认
+[`Diagnostic`] 一种输入，不必区分来源。
+
+消费方（外壳）的两个用途：左侧大纲栏，以及编辑器里的红/黄波浪线
+（`DiagnosticSet` + `InputState::diagnostics_mut()`）。
+
+**热路径实测**（3002 行 / 51 KB / 45 页，`tests/perf.rs`）：
+
+```
+增量重解析      0.1 ms   （只重解析 72 字节）
+大纲            1.1 ms   （751 个标题）
+语法诊断        0.0 ms
+增量排版        9.8 ms
+---- 一次敲键合计 11.1 ms ----
+```
+
+> **这里抓到一个真 bug。** 大纲初版的 `line_of()` 每个标题都从文本开头数一遍换行，
+> 于是「751 个标题 × 51 KB」退化成 O(n²)，实测 **106 ms**，一次敲键合计 116 ms——
+> 远超一帧。我当时还在注释里写「大纲条目通常不多，不值得为它建索引」，**判断错了**。
+> 改成一次性建行首索引 + 二分后是 **1.1 ms**（快 96 倍）。
+> 是 `tests/perf.rs` 把这条揪出来的 —— 这也是写它的全部理由。
+>
+> `增量排版 9.8 ms`：注意这是 45 页的文档。之前那个 1.8 ms 是 9 页的。
+
+#### 实现要点（保留供参考）
 
 ```rust
 /// 全量解析。纯函数。
@@ -775,7 +831,7 @@ Plan 1 落地后的状态。**实测环境**：Windows，Rust 1.98，依赖 `opt
 | A2 | 导出不重算 | 调用计数器 | 同 revision 计算次数 = 1 | 🟡 **部分**。外壳已做到「文档没换就不重出图」（`Arc::ptr_eq` 判定）；`ComputeGraph` + 调用计数器的完整形式暂缓（见下方「刻意不做的事」） |
 | A3 | on-type 延迟 | 连续输入 → 编译完成 | < 250ms | ✅ **平均 1.9 ms，最差 2.3 ms** |
 | A4 | 增量加速比 | 单次编辑编译 vs 冷编译 | 增量 < 全量 40% | ✅ **快 102.6×**（阈值等价于 >2.5×） |
-| A5 | 高亮帧预算 | 3000 行 `highlight()` 单次耗时 | ≤ 一帧 16ms | ⏳ Plan 3（`syntax-svc` 未建） |
+| A5 | 热路径帧预算 | 3000 行文档一次敲键的全部开销 | ≤ 一帧 16ms | ✅ **实测 11.1 ms**（增量重解析 0.1 + 大纲 1.1 + 诊断 0.0 + 增量排版 9.8）。**注**：原指标写的是 `highlight()`，但高亮最后没做（gpui-component 不接受自定义高亮器，见 §5.5），改测真正在热路径上的四项 |
 | A6 | 失败不白屏 | 故意引入语法错误 | 预览仍有内容 + 波浪线出现 | ✅ **已进引擎**。`EngineWorld::compile()` 维护 `success_doc`；5 个测试，其中用 `Arc::ptr_eq` 断言回退的是**同一份**旧文档 |
 | A7 | 无 fork | `cargo tree -i typst` | 只有 crates.io `0.15.1`，无 git 源 | ✅ `typst v0.15.1`，全图 0 个 git 源 |
 | A8 | 解析器健壮 | 对随机截断的 `.typ` 跑 `parse` | 不 panic | ✅ `a_syntax_error_yields_diagnostics_not_a_panic` |
@@ -792,7 +848,7 @@ Plan 1 落地后的状态。**实测环境**：Windows，Rust 1.98，依赖 `opt
 > 以上是**单次运行**的样本，不是 P95。要让 A3/A4 成为稳定门槛，需跑热身后的多次统计。
 > 目前这些数字足以证明**机制成立**。
 >
-> A5 仍是空白，不是失败 —— `syntax-svc` 还没写。
+> A5 已用「真实热路径」重测（见上）。
 > **不把未测的写成已达标，也不把未写的写成已实现。**
 
 ### 刻意不做的事（以及理由）

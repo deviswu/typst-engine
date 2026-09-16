@@ -17,12 +17,16 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::*;
-use gpui_component::highlighter::{LanguageConfig, LanguageRegistry};
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::highlighter::{
+    Diagnostic as Squiggle, DiagnosticSeverity, LanguageConfig, LanguageRegistry,
+};
+use gpui_component::input::{Input, InputEvent, InputState, Position};
 use gpui_component::{ActiveTheme as _, Root, h_flex, v_flex};
 
+use typst::diag::SourceDiagnostic;
 use typst::foundations::Bytes;
 use typst_engine::export::{RasterPage, pixel_per_pt_for_zoom, rasterize};
+use typst_engine::syntax as lang;
 use typst_engine::world::{EngineWorld, EntryState, embedded_and_system_fonts};
 use typst_layout::PagedDocument;
 
@@ -101,7 +105,6 @@ struct Status {
     compiles: usize,
     /// 光栅化次数。缩放**会**让它增加。
     rasters: usize,
-    errors: Vec<String>,
 }
 
 struct Previewer {
@@ -112,6 +115,13 @@ struct Previewer {
     doc: Option<Arc<PagedDocument>>,
     /// 缩放倍率。1.0 = 屏幕上「实际大小」（96 dpi）。
     zoom: f32,
+    /// 文档大纲。来自 `typst-syntax`，不是正则。
+    outline: Vec<lang::OutlineItem>,
+    /// 本次排版产出的原始诊断。留着是因为要把它们**映射成字节范围**
+    /// 去画波浪线，而转成字符串就找不回来了。
+    compile_errors: Vec<SourceDiagnostic>,
+    /// 语法错误 + 编译错误里「错误」的条数。
+    error_count: usize,
     /// 光栅化产物（GPU 纹理）。每次排版或缩放后重建。
     bitmaps: Vec<Arc<RenderImage>>,
     /// 当前纹理共占多少字节。用来把显存开销直接显示给用户。
@@ -168,6 +178,9 @@ impl Previewer {
             editor,
             doc: None,
             zoom: 1.0,
+            outline: Vec::new(),
+            compile_errors: Vec::new(),
+            error_count: 0,
             bitmaps: Vec::new(),
             texture_bytes: 0,
             last_text: String::new(),
@@ -230,17 +243,57 @@ impl Previewer {
         }
 
         if compiled.fresh {
-            self.status.errors.clear();
+            self.compile_errors.clear();
         } else {
-            self.status.errors = compiled
-                .errors
-                .iter()
-                .take(6)
-                .map(|e| e.message.to_string())
-                .collect();
+            self.compile_errors = compiled.errors;
         }
 
+        // ④ 语法服务。刻意用**引擎里那棵增量维护的树**
+        //    （`feed_memory` 刚就地重解析过），而不是 `Source::detached(text)`
+        //    再全量 parse 一遍。
+        self.refresh_language_services(cx);
+
         cx.notify();
+    }
+
+    /// 大纲 + 波浪线。两者都基于同一个 `Source`，所以一起算。
+    fn refresh_language_services(&mut self, cx: &mut Context<Self>) {
+        let Ok(source) = typst::World::source(&self.engine, self.engine.entry().main()) else {
+            return;
+        };
+
+        self.outline = lang::outline(&source);
+
+        // 语法错误（不编译就有）与编译错误**形状相同**，所以
+        // 交给同一个渲染器，不需要区分来源。
+        let mut diags = lang::syntax_diagnostics(&source);
+        diags.extend(lang::compile_diagnostics(&source, &self.compile_errors));
+        self.error_count = diags.iter().filter(|d| d.is_error).count();
+
+        let rope = self.editor.read(cx).text().clone();
+        self.editor.update(cx, |state, cx| {
+            if let Some(set) = state.diagnostics_mut() {
+                set.reset(&rope);
+                for d in &diags {
+                    let Some(start) = d.line_col else { continue };
+                    let end = squiggle_end(&source, d, start);
+                    let severity = if d.is_error {
+                        DiagnosticSeverity::Error
+                    } else {
+                        DiagnosticSeverity::Warning
+                    };
+                    set.push(
+                        Squiggle::new(
+                            Position::new(start.line as u32, start.col as u32)
+                                ..Position::new(end.line as u32, end.col as u32),
+                            d.message.clone(),
+                        )
+                        .with_severity(severity),
+                    );
+                }
+            }
+            cx.notify();
+        });
     }
 
     /// 从已排版的 `doc` 重新出图。**不碰编译器**。
@@ -317,15 +370,77 @@ impl Previewer {
                 self.status.compiles, self.status.rasters
             ));
 
-        if self.status.errors.is_empty() {
+        bar = bar.child(format!("{} 个标题", self.outline.len()));
+
+        if self.error_count == 0 {
             bar = bar.child(div().text_color(theme.success).child("✓ 无错误"));
         } else {
             bar = bar.child(div().text_color(theme.danger).child(format!(
                 "✗ {} 个错误（预览保留上次成功结果）",
-                self.status.errors.len()
+                self.error_count
             )));
         }
         bar
+    }
+
+    /// 左侧大纲栏。
+    fn render_outline(&self, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+
+        let body = v_flex()
+            .id("outline-body")
+            .flex_1()
+            .overflow_y_scroll()
+            .py_1()
+            .children(if self.outline.is_empty() {
+                vec![
+                    div()
+                        .px_3()
+                        .py_1()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("（还没有标题）")
+                        .into_any_element(),
+                ]
+            } else {
+                self.outline
+                    .iter()
+                    .map(|item| {
+                        div()
+                            .px_3()
+                            .py_0p5()
+                            .text_xs()
+                            .text_color(if item.depth == 1 {
+                                theme.foreground
+                            } else {
+                                theme.muted_foreground
+                            })
+                            .child(format!(
+                                "{}{}",
+                                "    ".repeat(item.depth.saturating_sub(1)),
+                                item.title
+                            ))
+                            .into_any_element()
+                    })
+                    .collect()
+            });
+
+        v_flex()
+            .w(px(228.))
+            .h_full()
+            .flex_shrink_0()
+            .border_r_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_sm()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child("大纲"),
+            )
+            .child(body)
     }
 
     fn render_errors(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -340,7 +455,39 @@ impl Previewer {
             .border_color(theme.border)
             .text_xs()
             .text_color(theme.danger)
-            .children(self.status.errors.iter().map(|e| div().child(e.clone())))
+            .children(
+                self.compile_errors
+                    .iter()
+                    .take(6)
+                    .map(|e| div().child(e.message.to_string())),
+            )
+    }
+}
+
+/// 波浪线的终点。
+///
+/// 至少覆盖一个字符；若诊断带着可用的字节范围、且终点**在同一行**，
+/// 就盖住整个病灶而不是戳一个孤零零的点（跨行的话用一个字符收尾，
+/// 免得算出一段横跨多行的矩形）。
+fn squiggle_end(
+    source: &typst::syntax::Source,
+    d: &lang::Diagnostic,
+    start: lang::LineCol,
+) -> lang::LineCol {
+    let one_char = lang::LineCol {
+        line: start.line,
+        col: start.col + 1,
+    };
+
+    let Some(range) = d.range.as_ref() else {
+        return one_char;
+    };
+    let end = lang::line_col(source, range.end);
+
+    if end.line == start.line && end.col > start.col {
+        end
+    } else {
+        one_char
     }
 }
 
@@ -368,7 +515,9 @@ fn to_texture(page: RasterPage) -> Option<Arc<RenderImage>> {
 impl Render for Previewer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let has_errors = !self.status.errors.is_empty();
+        let has_errors = !self.compile_errors.is_empty();
+
+        let outline_pane = self.render_outline(cx);
 
         let editor_pane = div()
             .w(px(520.))
@@ -417,6 +566,7 @@ impl Render for Previewer {
                     .flex_1()
                     .w_full()
                     .overflow_hidden()
+                    .child(outline_pane)
                     .child(editor_pane)
                     .child(preview_pane),
             )
