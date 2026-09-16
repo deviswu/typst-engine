@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::*;
+use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::highlighter::{
     Diagnostic as Squiggle, DiagnosticSeverity, LanguageConfig, LanguageRegistry,
 };
@@ -30,14 +31,16 @@ use typst::model::Destination;
 use typst_engine::export::{RasterPage, pdf as export_pdf, pixel_per_pt_for_zoom, rasterize_page};
 use typst_engine::jump::{Anchor, LayoutIndex};
 use typst_engine::syntax as lang;
-use typst_engine::world::{EngineWorld, EntryState, embedded_and_system_fonts};
+use typst_engine::world::{EngineWorld, EntryState, Packages, embedded_and_system_fonts};
 use typst_layout::PagedDocument;
 
+use markup::Markup;
 use settings::Settings;
 use themes::ThemeItem;
 
 mod coords;
 mod finder;
+mod markup;
 mod settings;
 mod themes;
 
@@ -88,6 +91,13 @@ const PAGE_PREFETCH: usize = 1;
 /// 唯一视觉证据。淡出而不是一直留着，是因为它是**一次性的**反馈，
 /// 不是「当前位置」的标记。
 const FLASH: Duration = Duration::from_millis(1400);
+
+/// 进程起点。给「首帧」「首次排版」这类一次性事件打时间戳 ——
+/// 「窗口多久出来」「排版多久」得是能对上的数字，不是感觉。
+fn since_start_ms() -> f64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
+}
 
 /// 前向跳转时把目标行放在视口顶部往下多少逻辑像素处 ——
 /// 上面留一点，好看见「这是哪一段」。
@@ -291,6 +301,8 @@ struct Previewer {
     /// 那一份」，前者是「现在想要的」。混用一个字段的话，`save_settings` 里
     /// 「变了才写」的比较永远相等 —— 界面换了主题、磁盘上却没写（踩过）。
     theme_name: Option<String>,
+    /// 首次排版还没做（推迟到窗口画出来之后，见 `render`）。
+    first_compile: bool,
     /// 状态栏那个主题下拉框。
     theme_select: Entity<SelectState<Vec<ThemeItem>>>,
     _theme_sub: Subscription,
@@ -315,7 +327,10 @@ impl Previewer {
         let mut engine = EngineWorld::new(
             embedded_and_system_fonts(),
             EntryState::new(root, &main_path),
-        );
+        )
+        // 包源：本地找不着就联网取官方源（`@preview/...`）。
+        // 下载落在 typst 自己的缓存目录，与 CLI 共用一份。
+        .with_packages(Packages::with_downloads());
         let main_id = engine.entry().main();
 
         // 把初始文本放进内存覆盖层 + 语法树，这样磁盘上有没有这个文件都无所谓。
@@ -384,7 +399,7 @@ impl Previewer {
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
 
-        let mut this = Self {
+        let this = Self {
             engine,
             main_path,
             editor,
@@ -424,6 +439,7 @@ impl Previewer {
             settings_dirty: false,
             settings_writes: 0,
             explicit_file,
+            first_compile: true,
             theme_name,
             theme_select,
             _theme_sub: theme_sub,
@@ -435,8 +451,8 @@ impl Previewer {
         // Ctrl+S 之类的全局快捷键根本不会触达 on_action。
         this.editor.update(cx, |state, cx| state.focus(window, cx));
 
-        // 首次编译不走守卫：文本为空也该先把世界建起来。
-        this.recompile(cx);
+        // **不在这里编译**：45 页冷编译 200+ ms，同步做的话窗口要等它排完
+        // 才出现。推迟到第一帧画完（见 `render` 里的 `first_compile`）。
         this
     }
 
@@ -499,9 +515,33 @@ impl Previewer {
             }
         }
 
+        // 取包（尤其下载）是同步阻塞的，就卡在这次排版里 —— 把耗时报出来，
+        // 「为什么这一下慢」不该靠猜。缓存命中是零点几毫秒，真下载几百毫秒起。
+        for fetch in self.engine.packages().take_fetches() {
+            let ms = fetch.elapsed.as_secs_f64() * 1000.0;
+            println!(
+                "[typst-live] 取包 {}：{ms:.1} ms → {}",
+                fetch.spec,
+                fetch.path.display()
+            );
+            if ms > 50.0 {
+                self.message = Some(format!("取包 {}（{ms:.0} ms）", fetch.spec));
+            }
+        }
+
         if compiled.fresh {
             self.compile_errors.clear();
         } else {
+            // 终端里也要能看见为什么失败：预览上的错误框只有开窗的人看得到
+            let first = compiled
+                .errors
+                .first()
+                .map(|err| err.message.to_string())
+                .unwrap_or_else(|| "（没有诊断信息）".to_owned());
+            println!(
+                "[typst-live] 排版失败：{} 条错误，第一条：{first}",
+                compiled.errors.len()
+            );
             self.compile_errors = compiled.errors;
         }
 
@@ -844,6 +884,42 @@ impl Previewer {
             state.set_cursor_position(Position::new(line as u32, 0), window, cx);
         });
         self.message = Some(format!("已跳到第 {} 行", line + 1));
+        cx.notify();
+    }
+
+    // ── 工具栏 ────────────────────────────────────────
+
+    /// 工具栏按钮：按 [`Markup`] 改一次编辑器内容。
+    ///
+    /// 只有空范围的插入需要先挪光标（`insert` 在光标处插）；
+    /// 包住选区那种直接用 `replace` 顶掉当前选区即可。
+    ///
+    /// 注意 `insert` / `replace` 走的是 gpui-component 的**静默**路径
+    /// （不发 `InputEvent::Change`），所以这里得自己触发一次重排 ——
+    /// `format_document` 也踩过同一条。
+    fn apply_markup(&mut self, kind: Markup, window: &mut Window, cx: &mut Context<Self>) {
+        let (text, selection) = {
+            let state = self.editor.read(cx);
+            (state.text().to_string(), state.selected_range())
+        };
+        let edit = markup::edit(&text, selection, kind);
+
+        self.editor.update(cx, |state, cx| {
+            if edit.range.is_empty() {
+                let position = state.text().offset_to_position(edit.range.start);
+                state.set_cursor_position(position, window, cx);
+                state.insert(edit.text.clone(), window, cx);
+            } else {
+                state.replace(edit.text.clone(), window, cx);
+            }
+            // 光标落点自己定：插空壳时要夹在中间，不然接着打字会打到壳外面
+            let position = state.text().offset_to_position(edit.cursor);
+            state.set_cursor_position(position, window, cx);
+        });
+
+        self.dirty = true;
+        self.recompile(cx);
+        self.message = Some(format!("已插入{}", kind.label()));
         cx.notify();
     }
 
@@ -1482,16 +1558,26 @@ impl Previewer {
 
 impl Render for Previewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // 窗口可能被拖到另一块缩放不同的显示器上。
-        // 系数变了就得按新的重新出图，否则要么糊（变大）、要么白费显存（变小）。
-        let scale_factor = window.scale_factor();
-        if (scale_factor - self.scale_factor).abs() > f32::EPSILON {
-            println!(
-                "[typst-live] 显示器缩放变了：{:.2} → {:.2}，重新出图",
-                self.scale_factor, scale_factor
-            );
-            self.scale_factor = scale_factor;
-            self.rerasterize();
+        // 首次排版**推迟到这一帧画完之后**再跑：先让窗口出现（带一句
+        // 「首次排版中…」），别让用户盯着一个还没画出来的窗口等 200+ ms。
+        if self.first_compile {
+            self.first_compile = false;
+            println!("[typst-live] 首帧 @{:.0} ms（窗口已画）", since_start_ms());
+            cx.spawn(async move |this, cx| {
+                // 让出一轮执行器，确保这一帧真的画出去了再排
+                cx.background_executor().timer(Duration::ZERO).await;
+                _ = this.update(cx, |this, cx| {
+                    println!("[typst-live] 首次排版 @{:.0} ms", since_start_ms());
+                    this.recompile(cx);
+                    println!(
+                        "[typst-live] 首次排版完成：{:.1} ms（{} 页）@{:.0} ms",
+                        this.status.compile_ms,
+                        this.status.pages,
+                        since_start_ms()
+                    );
+                });
+            })
+            .detach();
         }
 
         // 窗口尺寸/位置变了就记下来（拖动时会变很多次，所以写盘是防抖的）。
@@ -1532,7 +1618,27 @@ impl Render for Previewer {
 
         let outline_pane = self.render_outline(cx);
 
-        let editor_pane = div()
+        // 工具栏：一键插入。放编辑区上方（`wu` 也是这么放的）。
+        let toolbar = h_flex()
+            .w_full()
+            .flex_shrink_0()
+            .px_2()
+            .py_1()
+            .gap_0p5()
+            .border_b_1()
+            .border_color(theme.border)
+            .children(Markup::ALL.into_iter().map(|kind| {
+                Button::new(("markup", kind as usize))
+                    .ghost()
+                    .compact()
+                    .label(kind.label())
+                    .tooltip(kind.hint())
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.apply_markup(kind, window, cx)),
+                    )
+            }));
+
+        let editor_pane = v_flex()
             .w(px(520.))
             .h_full()
             .flex_shrink_0()
@@ -1554,7 +1660,8 @@ impl Render for Previewer {
                     cx.notify();
                 }),
             )
-            .child(Input::new(&self.editor).h_full());
+            .child(toolbar)
+            .child(Input::new(&self.editor).flex_1());
 
         // 布局尺寸一律用 `page_sizes`（按 pt 算出来的），**不用纹理的像素尺寸**。
         // 两者能对上（纹理 = pt × ppp，逻辑 = 纹理 / 屏缩放 = pt × 96/72 × zoom），
@@ -1660,7 +1767,20 @@ impl Render for Previewer {
                     }),
             );
 
-        let preview_pane = if has_errors {
+        let preview_pane = if self.doc.is_none() {
+            // 还没有排版结果（首次排版还在路上）—— 别给一片空白，
+            // 让人知道它在干活
+            v_flex()
+                .flex_1()
+                .h_full()
+                .items_center()
+                .justify_center()
+                .bg(theme.secondary)
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child("首次排版中…（大文档冷编译要几百毫秒）")
+                .into_any_element()
+        } else if has_errors {
             v_flex()
                 .flex_1()
                 .h_full()
@@ -1816,6 +1936,13 @@ fn main() {
         settings.zoom,
         settings.file,
     );
+    match Packages::with_downloads().cache_dir() {
+        Some(dir) => println!(
+            "[typst-live] 包源：本地目录 + 官方源（下载缓存 {}）",
+            dir.display()
+        ),
+        None => println!("[typst-live] 包源：只认本地目录（系统缓存目录不可用）"),
+    }
 
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
     app.run(move |cx| {

@@ -28,9 +28,11 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 | L4 | 语法服务：大纲 / 诊断 / 字数 | ✅（高亮仍走 tree-sitter） |
 | L5 | GPUI 外壳 | ✅ |
 | L6 | 跳转索引（源码字节 ⇄ 页/页内 pt） | ✅ `crates/engine/src/jump.rs` + 外壳双击接入 |
-| L7 | 外壳体验：设置持久化 · 链接可点 · 主题切换 | ✅ `crates/app/src/{settings,themes,coords}.rs` |
+| L7 | 外壳体验：设置持久化 · 链接可点 · 主题切换 · 工具栏 | ✅ `crates/app/src/{settings,themes,coords,markup}.rs` |
+| L8 | `@preview` 联网取包 | ✅ `Packages::with_downloads()`（typst-kit 的 SystemPackages） |
+| L9 | 长文档首屏（首次排版推迟到开窗之后） | ✅ 窗口先出来，预览区显示「首次排版中…」 |
 
-- 26 个 commit，约 7400 行 Rust（35 个 `.rs` 文件），clippy 与 `cargo fmt` 都干净
+- 28 个 commit，8000 行 Rust（36 个 `.rs` 文件），clippy 与 `cargo fmt` 都干净
 - 远端：`github.com/deviswu/typst-engine`（public，`master`，SSH）—— `git push` 即可
 - 远端：`github.com/deviswu/typst-engine`（public，`master`，SSH）—— 已推完，`git push` 即可
 - 依赖只有 crates.io 官方 `typst 0.15.1`，无 git fork
@@ -52,18 +54,21 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 
 ## 下一步（按我的推荐排序）
 
-1. **工具栏** —— `wu` 有：标题 / 加粗 / 对齐 / 颜色 / 上下标 / 公式 / 图片 /
-   表格 / 分页 一键插入。中等工作量，纯 UI。
-2. **长文档首屏** —— 45 页冷编译 222 ms。可考虑：先出第一页再后台排完，
-   或对首屏用 syntax-only 先给个骨架。
-3. **`@preview` 联网下载** —— 引擎的 `Packages` 目前只认本地包目录。
-   要用 `typst-kit::packages::SystemPackages` + `SystemDownloader`（spec §9 R4 已查清）。
+1. **首次排版的过程感** —— 现在只是「推迟 + 一行提示」。177 页要 854 ms，
+   可以先把第一页排出来先显示（需要把 `typst::compile` 换成按页/分段的办法，
+   或者给首屏用 syntax-only 骨架）—— **先写能复现慢编译的测试再动**。
+2. **下载包时的进度** —— `typst-kit` 有 `ProgressDownloader`（带回调）。
+   现在只在下完之后报一条耗时，慢网下看着像卡死。
+3. **设置界面** —— 现在只有「主题」一个下拉框；缩放/上次文件/包源都只能手改
+   `settings.conf`。另外可以考虑把「打开的文件」列成最近文件。
 
 想做的还有（都小）：索引改按页惰性建（22 ms → 0.5 ms 级，**只有真感觉到卡顿才做**）、
 双击只跳转不选词（一行 `stop_propagation`）、主题列表改成读 `themes/` 目录
-（`ThemeRegistry::watch_dir`，现在只在启动时抓一次）。
+（`ThemeRegistry::watch_dir`，现在只在启动时抓一次）、
+工具栏按钮的自定义（现在写死在 `Markup::ALL`）。
 
-刚做完（不要再提）：坐标换算单测、设置持久化、预览链接可点、主题切换。
+刚做完（不要再提）：坐标换算单测、设置持久化、预览链接可点、主题切换、
+工具栏、长文档首屏、`@preview` 联网取包。
 
 ## 已论证「不做」（别重新捡起来）
 
@@ -91,6 +96,9 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 | **窗口每开一次往下爬 11px** | 存的是 `window.bounds()`（客户区）而不是 `window_bounds()` | 存后者（下次开窗用的就是那一份几何） |
 | **换了主题、磁盘上没写** | 「现在想要的」与「已经存盘的那份」混用一个字段，「变了才写」的比较永远相等 | 分开存（`theme_name` vs `settings.theme`） |
 | `#[test]` 报 recursion limit | 文件里 `use gpui::*` 把 gpui 自己的 `#[gpui::test]`（名字就叫 `test`）带进来了 | 那个文件只引要用的类型，不要通配符 |
+| 工具栏插入后预览不更新 | gpui-component 的 `insert` / `replace` 走**静默**路径（不发 `InputEvent::Change`） | 自己 `recompile()`（`format_document` 同一条） |
+| `@preview` 那行正文报 label 不存在 | 正文里的 `@preview` 被当成**标签引用**（`@name` 是引用语法） | 正文要写 `\@preview` 或换个说法 |
+| 取包卡住好几秒没反应 | 下载是**同步阻塞**在排版中间的 | 每次都把取包耗时打印出来（冷取 452 ms / 热取 0.1 ms） |
 | 右键示例文档报波浪线 | 我写成了 Markdown 的 `**粗体**`，Typst 是 `*...*` | — |
 
 **通用教训**：多窗口桌面上截图对比不可靠（会被别的窗口挡住/干扰），
