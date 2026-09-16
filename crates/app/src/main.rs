@@ -31,6 +31,7 @@ use typst_engine::syntax as lang;
 use typst_engine::world::{EngineWorld, EntryState, embedded_and_system_fonts};
 use typst_layout::PagedDocument;
 
+mod coords;
 mod finder;
 
 actions!(
@@ -842,31 +843,31 @@ impl Previewer {
 
     /// 窗口坐标 → 页内 pt。
     ///
-    /// `bounds_for_item` 给的是**内容坐标**（`ScrollHandle::top_item` 用的
-    /// 就是同一套）：要加回滚动偏移才是真正画在窗口里的位置。
-    /// 不带偏移的话，预览一旦滚过，点击就会偏出整页 —— 错得很隐蔽。
+    /// 算术在 [`coords`] 里（纯函数 + 单测）。这里只负责把 gpui 的类型拆开。
     fn window_to_page_pt(&self, position: Point<Pixels>, page: usize) -> Option<(f32, f32)> {
         let bounds = self.scroll.bounds_for_item(page)?;
         let offset = self.scroll.offset();
-        let local = point(
-            position.x - bounds.origin.x - offset.x,
-            position.y - bounds.origin.y - offset.y,
-        );
-        let base = pixel_per_pt_for_zoom(self.zoom);
-        Some((local.x.as_f32() / base, local.y.as_f32() / base))
+        Some(coords::page_pt_from_window(
+            (position.x.as_f32(), position.y.as_f32()),
+            (bounds.origin.x.as_f32(), bounds.origin.y.as_f32()),
+            (offset.x.as_f32(), offset.y.as_f32()),
+            self.zoom,
+        ))
     }
 
-    /// 页内 pt → 窗口坐标（`window_to_page_pt` 的反函数）。
+    /// 页内 pt → 窗口坐标（[`Self::window_to_page_pt`] 的反函数）。
     ///
     /// 前向跳转靠它算出「目标现在画在哪」，再据此定新的滚动偏移。
     fn page_pt_to_window(&self, page: usize, x: f32, y: f32) -> Option<Point<Pixels>> {
         let bounds = self.scroll.bounds_for_item(page)?;
         let offset = self.scroll.offset();
-        let base = pixel_per_pt_for_zoom(self.zoom);
-        Some(point(
-            bounds.origin.x + px(x * base) + offset.x,
-            bounds.origin.y + px(y * base) + offset.y,
-        ))
+        let (wx, wy) = coords::window_from_page_pt(
+            (x, y),
+            (bounds.origin.x.as_f32(), bounds.origin.y.as_f32()),
+            (offset.x.as_f32(), offset.y.as_f32()),
+            self.zoom,
+        );
+        Some(point(px(wx), px(wy)))
     }
 
     /// 在某一页留下一块会淡出的高亮。
