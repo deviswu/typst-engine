@@ -28,7 +28,7 @@ use gpui_component::highlighter::{
 use gpui_component::input::{Input, InputEvent, InputState, Position};
 use gpui_component::list::ListItem;
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_component::resizable::{h_resizable, resizable_panel};
+use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_component::select::{Select, SelectEvent, SelectState};
 use gpui_component::tree::{Tree, TreeEvent, TreeState};
 use gpui_component::{
@@ -338,6 +338,11 @@ struct Flash {
 struct Previewer {
     engine: EngineWorld,
     main_path: PathBuf,
+    /// 布局数字报过没有（开机报一次，见 `report_layout_once`）。
+    layout_reported: bool,
+    /// 中间三块分区的状态。**显式持有**是为了能读到每个分区的真实宽度 ——
+    /// 「编辑区到底多宽」这种事不该靠推算（踩过一次：分区 875px、内容只有 117px）。
+    split_state: Entity<ResizableState>,
     /// 打开的标签页（目录树/快速打开都在标签里开）
     tabs: Vec<Tab>,
     /// 当前活动标签（0 起）
@@ -513,6 +518,8 @@ impl Previewer {
             .map_shadow(&main_path, Bytes::from_string(source.clone()));
         engine.sources().feed_memory(main_id, &source);
 
+        let split_state = cx.new(|_| ResizableState::default());
+
         // 先把初始文本留一份给标签页（`source` 下面会被编辑器拿走）
         let initial_text = source.clone();
 
@@ -520,10 +527,8 @@ impl Previewer {
             InputState::new(window, cx)
                 .multi_line(true)
                 .code_editor("typst")
-                // ★ 关掉软换行：**默认是 true**，于是长行被折断成好几行。
-                // 代码编辑器里这很碍事（缩进层级、表格、公式全被搓乱），
-                // 关掉之后 gpui-component 会自动出横向滚动条。
-                .soft_wrap(false)
+                // 软换行保持 gpui-component 的默认（开）—— 长行折行显示是这个
+                // 应用想要的；「显得窄」是宽度问题，得从分区尺寸上解决。
                 .default_value(source)
         });
 
@@ -641,6 +646,8 @@ impl Previewer {
         let this = Self {
             engine,
             main_path: main_path.clone(),
+            split_state,
+            layout_reported: false,
             tabs: vec![Tab {
                 path: main_path,
                 text: initial_text,
@@ -895,6 +902,31 @@ impl Previewer {
         self.bitmaps = vec![None; self.page_sizes.len()];
         self.texture_bytes = 0;
         self.live_range = None;
+    }
+
+    /// 开机把布局数字报一次（**永久保留的诊断**）。
+    ///
+    /// 起因：「编辑区太窄」那次，分区面板是 875px 而内容只有 117px ——
+    /// 面板只给位置与尺寸，内容不加 `w_full()` 就缩成内容宽。
+    /// 有了这行数字，下次同类问题一眼就能定位是谁占走了宽度。
+    fn report_layout_once(&mut self, window: &Window, cx: &Context<Self>) {
+        if self.layout_reported {
+            return;
+        }
+        let sizes = self.split_state.read(cx).sizes().clone();
+        if sizes.len() < 3 {
+            return; // 还没布局出来
+        }
+        self.layout_reported = true;
+
+        let nums: Vec<String> = sizes.iter().map(|p| format!("{:.0}", p.as_f32())).collect();
+        println!(
+            "[typst-live] 布局：窗口 {:.0}px → 侧栏 {} / 编辑 {} / 展示 {}",
+            window.bounds().size.width.as_f32(),
+            nums[0],
+            nums[1],
+            nums[2]
+        );
     }
 
     /// 预览「适应宽度」：让页宽 = 展示区宽 - 两侧边距。
@@ -2477,6 +2509,7 @@ impl Previewer {
         };
 
         v_flex()
+            .w_full()
             .h_full()
             .min_w_0()
             .overflow_hidden()
@@ -3136,56 +3169,9 @@ impl Previewer {
 
 impl Render for Previewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // AI 评审阶段把焦点拿到浮层上：gpui 的动作派发**从聚焦节点开始**，
-        // 没有焦点就没有起点（NEXT.md 里那个坑：所有快捷键静默失效）。
-        if self.ai.stage == AiStage::Review && !self.ai_focus.is_focused(window) {
-            self.ai_focus.focus(window, cx);
-        }
+        // 开机报一次布局：窗口多宽、三块分区各多宽
+        self.report_layout_once(window, cx);
 
-        // 首次排版**推迟到这一帧画完之后**再跑：先让窗口出现（带一句
-        // 「首次排版中…」），别让用户盯着一个还没画出来的窗口等 200+ ms。
-        if self.first_compile {
-            self.first_compile = false;
-            println!("[typst-live] 首帧 @{:.0} ms（窗口已画）", since_start_ms());
-            cx.spawn(async move |this, cx| {
-                // 让出一轮执行器，确保这一帧真的画出去了再排
-                cx.background_executor().timer(Duration::ZERO).await;
-                _ = this.update(cx, |this, cx| {
-                    println!("[typst-live] 首次排版 @{:.0} ms", since_start_ms());
-                    this.recompile(cx);
-                    println!(
-                        "[typst-live] 首次排版完成：{:.1} ms（{} 页）@{:.0} ms",
-                        this.status.compile_ms,
-                        this.status.pages,
-                        since_start_ms()
-                    );
-                });
-            })
-            .detach();
-        }
-
-        // 窗口尺寸/位置变了就记下来（拖动时会变很多次，所以写盘是防抖的）。
-        //
-        // ★ 用 `window_bounds()` 而不是 `bounds()`：前者就是「下次开窗该用哪份
-        // 几何」，与我们交给 `WindowOptions` 的是同一个坐标系；`bounds()` 报的是
-        // **客户区**，比请求值差一个非客户区高度（本机实测 **+11px**）——
-        // 拿它存下来，窗口每开一次就在屏幕上往下爬 11px。
-        if let WindowBounds::Windowed(rect) = window.window_bounds() {
-            let boxed = (
-                rect.origin.x.as_f32() as i32,
-                rect.origin.y.as_f32() as i32,
-                rect.size.width.as_f32() as i32,
-                rect.size.height.as_f32() as i32,
-            );
-            if self.pending_window != Some(boxed) {
-                self.pending_window = Some(boxed);
-                self.touch_settings(cx);
-            }
-        }
-
-        // 下面几项都要 `&mut cx`，而 `cx.theme()` 是不可变借用 ——
-        // 所以它们必须放在拿 theme 之前（这个坑在 NEXT.md 里记着）。
-        //
         // 「适应宽度」：按当前展示区宽度重算缩放（拖动分区/改窗口都会走到这）
         self.fit_zoom_to_viewport();
 
@@ -3330,6 +3316,9 @@ impl Render for Previewer {
         // 编辑区不要圆角也不要边线：只靠**底色**与展示区区分。
         // `Input` 自带的边框/圆角/焦点描边都要关掉（appearance 管底色，保留它）。
         let editor_pane = v_flex()
+            // ★ 必须 `w_full`：分区只负责给位置与尺寸，内容自己不撑起来的话
+            // 会缩成「内容宽度」（实测 875px 的面板里内容只有 117px）
+            .w_full()
             .h_full()
             .min_w_0()
             // 内容不许溢出：拖窄时该裁剪，而不是盖到左边的目录/大纲上
@@ -3500,11 +3489,12 @@ impl Render for Previewer {
                 // flex_1 + min_h_0/min_w_0`，所以这里**不要**再调 flex_1（它没有
                 // 实现 Styled，调了也编译不过），直接当 flex 子项放就行。
                 h_resizable("main-split")
+                    .with_state(&self.split_state)
                     .child(
                         // 侧栏给个尺寸范围：拖到过窄会把文字挤爆
                         resizable_panel()
-                            .size(px(200.))
-                            .size_range(px(160.)..px(420.))
+                            .size(px(180.))
+                            .size_range(px(150.)..px(420.))
                             .child(sidebar_pane),
                     )
                     .child(
@@ -3513,14 +3503,16 @@ impl Render for Previewer {
                         // 编辑区拿最大份额（800/1520 ≈ 53%）：它才是天天用的那块。
                         // 展示区小一点没关系 —— 预览是「适应宽度」，自己会缩。
                         resizable_panel()
-                            .size(px(800.))
-                            .size_range(px(360.)..px(2400.))
+                            .size(px(1000.))
+                            .size_range(px(400.)..px(2600.))
                             .child(editor_pane),
                     )
                     .child(
+                        // 展示区让出份额：预览是「适应宽度」，自己会缩，
+                        // 而编辑区的宽度是**刚需**（软换行下它决定一行能放多少字）
                         resizable_panel()
-                            .size(px(520.))
-                            .size_range(px(320.)..px(2400.))
+                            .size(px(420.))
+                            .size_range(px(300.)..px(2600.))
                             .child(self.render_right_pane(preview_pane, cx)),
                     ),
             )
