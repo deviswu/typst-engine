@@ -8,6 +8,39 @@ Typst 的**实时增量编译引擎** —— 一个 UI 无关的 Rust 库。
 - **不依赖 tree-sitter** —— 语法树直接来自官方 `typst-syntax`
 - **支持未保存内容** —— 通过覆盖式虚拟文件系统，编译器看到的就是你正在敲的文本
 
+## 功能
+
+### Typst 编辑（与 `wu` 对齐，但全部进程内）
+
+| 功能 | `wu` 的做法 | 本项目的做法 |
+|---|---|---|
+| 实时编译预览 | 外部 `typst watch` 子进程 + PDF 轮询 | **进程内** `typst::compile`，敲键即重排 |
+| 编译错误波浪线 | 跑 `typst compile --diagnostic-format short` | **进程内**，而且**不编译**就能先报语法错误 |
+| 代码格式化 | 要求用户先装 `typstyle` 可执行文件 | **`typstyle-core` 进程内**，无安装前置 |
+| 导出 PDF | 外部 `typst compile` | **`typst-pdf` 直接吃已排版的 `PagedDocument`** |
+| 字数统计 | app 内的私有逻辑 | 引擎内，**有测试**（词数规则写清楚了） |
+| 源码大纲 | 正则提取 `=` 标题 | `typst-syntax` 的 `ast::Heading`，可点击跳转 |
+| 手动重编译 | 重启 watch | 作废源文件缓存后重编（把外部改动吃进来） |
+
+### 快捷键
+
+| 快捷键 | 功能 |
+|---|---|
+| `Ctrl+S` | 保存当前文件（写盘后撤掉内存覆盖层） |
+| `Ctrl+B` | 手动重新编译（作废源文件缓存） |
+| `Ctrl+Shift+F` | 格式化（进程内 typstyle） |
+| `Ctrl+E` | 导出 PDF（到同名的 `.pdf`） |
+| `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | 预览缩放 放大 / 缩小 / 100% |
+| 点大纲条目 | 光标跳到那一行 |
+
+### 没有对齐 `wu` 的部分（不是说做不到，是判断不值得）
+
+`wu` 还有目录树、多标签、项目搜索、快速打开、最近文件、术语表、Markdown 预览、
+图片查看、**交互式终端**、**AI 诊断/对话改稿**、编辑区↔PDF 双向联动。
+
+这些要么是重建 `wu` 的整个外壳（而本项目的价值在引擎），要么与「实时编译」这个核心无关。
+把引擎做扎实、把 Typst 编辑本身做好，比再做一个 `wu` 有意义。
+
 ## 跑起来看
 
 ```bash
@@ -47,7 +80,14 @@ cargo run --example realtime   # 不开窗，在终端里跑逐字输入的性�
 | L4 | 语法服务 | ✅ 大纲 + 波浪线（高亮仍走 tree-sitter，见下） |
 | L5 | GPUI 外壳（大纲栏 · 波浪线 · 0.25×–4× 缩放） | ✅ `crates/app`（`typst-live`） |
 
-测试：**106 个全绿**（92 单测 + 14 集成），clippy 零警告。
+测试：**130 个全绿**（116 单测 + 14 集成），clippy 零警告。
+
+> **一个值得记下来的 gpui 坑**：`Window::dispatch_action` 是**从当前聚焦节点**
+> 开始沿 dispatch path 上溯的（`window.rs:1992`）。如果窗口里**没有任何节点有焦点**，
+> 动作派发就没有起点 —— `on_action` 的处理函数永远不会被调用，
+> **所有全局快捷键静默失效**。本应用初版就中了这一条：启动后没给编辑器设焦点，
+> 于是必须先点一下编辑器才能打字，而且在那之前 Ctrl+S 之类全都没反应。
+> 修法是启动时 `state.focus(window, cx)`。
 
 ### L4：做了大纲与波浪线，没做高亮（附理由）
 
@@ -88,6 +128,8 @@ typst-engine/                      Cargo workspace
 ├── crates/engine/src/
 │   ├── path_util.rs               就地消掉 `.` / `..`
 │   ├── export/svg.rs              页面 → SVG（导出 / 将来的页内 diff）
+│   ├── format.rs                  进程内格式化（typstyle-core）
+│   ├── export/pdf.rs              页面 → PDF（typst-pdf）
 │   ├── export/pixmap.rs           页面 → 位图（屏幕预览，**DPI 可控**）
 │   ├── syntax/outline.rs          文档大纲
 │   ├── syntax/diagnostic.rs       语法/编译诊断 + Span → 行列
