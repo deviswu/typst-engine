@@ -279,6 +279,23 @@ impl Default for AiEdit {
     }
 }
 
+/// 一个标签页。
+///
+/// **只存最小必要状态**：路径、文本、未保存标记。视图状态（右栏模式、滚动位置）
+/// 与排版结果都**不按标签缓存** —— 切回一个标签会重新编译（方案 A）。
+///
+/// 为什么先这么做：引擎的入口（`EntryState` / `success_doc` / 源缓存）是单份的，
+/// 要让每个标签各自持有排版结果，得把引擎从「单入口」改成多入口 —— 那是真架构改动，
+/// 值得单独一轮。先把标签这张「皮」做对，再看切标签的 200ms 到底碍不碍事。
+#[derive(Clone)]
+struct Tab {
+    path: PathBuf,
+    /// 最后一次从编辑器收回来的文本
+    text: String,
+    /// 有未保存的修改
+    dirty: bool,
+}
+
 /// 左栏显示什么。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Sidebar {
@@ -321,6 +338,10 @@ struct Flash {
 struct Previewer {
     engine: EngineWorld,
     main_path: PathBuf,
+    /// 打开的标签页（目录树/快速打开都在标签里开）
+    tabs: Vec<Tab>,
+    /// 当前活动标签（0 起）
+    active_tab: usize,
     editor: Entity<InputState>,
     /// 排版结果。缩放时原样不动 —— 这是「排版 / 光栅化」两层的分界。
     doc: Option<Arc<PagedDocument>>,
@@ -492,6 +513,9 @@ impl Previewer {
             .map_shadow(&main_path, Bytes::from_string(source.clone()));
         engine.sources().feed_memory(main_id, &source);
 
+        // 先把初始文本留一份给标签页（`source` 下面会被编辑器拿走）
+        let initial_text = source.clone();
+
         let editor = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
@@ -612,7 +636,13 @@ impl Previewer {
 
         let this = Self {
             engine,
-            main_path,
+            main_path: main_path.clone(),
+            tabs: vec![Tab {
+                path: main_path,
+                text: initial_text,
+                dirty: false,
+            }],
+            active_tab: 0,
             editor,
             doc: None,
             // 上次的缩放从设置里恢复（还要夹一次，手改过的设置可能越界）；
@@ -1961,7 +1991,9 @@ impl Previewer {
         self.open_in_editor(full, text, label, window, cx);
     }
 
-    /// 在编辑器里打开一个文本文件。目录树点击与快速打开共用它。
+    /// 在编辑器里打开一个文本文件（目录树点击与快速打开共用）。
+    ///
+    /// 内部走标签页：已开着就切过去，没开就新开一个。
     fn open_in_editor(
         &mut self,
         full: PathBuf,
@@ -1970,34 +2002,192 @@ impl Previewer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if full == self.main_path {
-            self.message = Some(format!("已经在编辑 {label}"));
+        self.open_in_tab(full, text, label, window, cx);
+    }
+
+    // ── 标签页 ───────────────────────────────────────
+
+    /// 把编辑器里的文本收回活动标签。**切/关标签前必须做**，否则改动丢。
+    fn stash_active_tab(&mut self, cx: &Context<Self>) {
+        let text = self.editor.read(cx).text().to_string();
+        let dirty = self.dirty;
+        if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+            tab.text = text;
+            tab.dirty = dirty;
+        }
+    }
+
+    /// 打开一个文件到标签页：已开就切过去，没开就新建。
+    fn open_in_tab(
+        &mut self,
+        full: PathBuf,
+        text: String,
+        label: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self.tabs.iter().position(|tab| tab.path == full) {
+            self.switch_tab(index, window, cx);
+            self.message = Some(format!("切到 {label}"));
             cx.notify();
             return;
         }
 
-        // 换文档：字体留着，入口 / 覆盖层 / 源缓存 / 上次成功结果都重置。
-        self.engine.reopen(&self.root, &full);
-        self.main_path = full;
-        // 打开的是用户自己的文件 —— 从此它就是「上次打开的文件」
+        self.stash_active_tab(cx);
+        self.tabs.push(Tab {
+            path: full,
+            text,
+            dirty: false,
+        });
+        self.active_tab = self.tabs.len() - 1;
+        let tab = self.tabs[self.active_tab].clone();
+        self.load_tab(&tab, window, cx);
+    }
+
+    /// 切到第 `index` 个标签。
+    fn switch_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() || index == self.active_tab {
+            return;
+        }
+        self.stash_active_tab(cx);
+        self.active_tab = index;
+        let tab = self.tabs[index].clone();
+        self.load_tab(&tab, window, cx);
+    }
+
+    /// 把一个标签的文本装进编辑器并重新编译。
+    ///
+    /// 这就是方案 A 的代价所在：**切回来要重编**（引擎入口是单份的）。
+    /// 字体、包缓存都留着，所以主要是排版本身的开销。
+    fn load_tab(&mut self, tab: &Tab, window: &mut Window, cx: &mut Context<Self>) {
+        let started = Instant::now();
+
+        // 换入口：字体留着，入口 / 覆盖层 / 源缓存 / 上次成功结果都重置。
+        self.engine.reopen(&self.root, &tab.path);
+        self.main_path = tab.path.clone();
         self.explicit_file = true;
         self.touch_settings(cx);
         self.doc = None;
         self.bitmaps.clear();
         self.texture_bytes = 0;
         self.current_page = 0;
-        self.dirty = false;
+        self.dirty = tab.dirty;
         // 置空是为了让下面的 recompile 不受「文本没变就不排」的干扰
         self.last_text = String::new();
-
         self.right = RightPane::Preview;
-        self.message = Some(format!("打开 {label}"));
 
         self.editor.update(cx, |state, cx| {
-            state.set_value(text, window, cx);
+            state.set_value(tab.text.clone(), window, cx);
             state.focus(window, cx);
         });
         self.recompile(cx);
+
+        println!(
+            "[typst-live] 切标签 → {}（{:.0} ms，{} 页）",
+            short_label(&tab.path),
+            started.elapsed().as_secs_f64() * 1000.0,
+            self.status.pages
+        );
+        self.message = Some(format!("打开 {}", short_label(&tab.path)));
+    }
+
+    /// 关一个标签。关掉最后一个就留一个空的「未命名」，而不是关窗口。
+    fn close_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        let was_active = index == self.active_tab;
+        if was_active {
+            self.stash_active_tab(cx);
+        }
+        let removed = self.tabs.remove(index);
+        self.message = Some(format!("关闭 {}", short_label(&removed.path)));
+
+        if self.tabs.is_empty() {
+            let path = self.root.join("未命名.typ");
+            self.tabs.push(Tab {
+                path: path.clone(),
+                text: String::new(),
+                dirty: false,
+            });
+            self.active_tab = 0;
+            let tab = self.tabs[0].clone();
+            self.load_tab(&tab, window, cx);
+        } else if was_active {
+            self.active_tab = self.active_tab.min(self.tabs.len() - 1);
+            let tab = self.tabs[self.active_tab].clone();
+            self.load_tab(&tab, window, cx);
+        } else if index < self.active_tab {
+            self.active_tab -= 1;
+        }
+
+        cx.notify();
+    }
+
+    /// 标签栏：编辑区上方一条，文件名 + × 关闭。
+    fn render_tabs(&self, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+
+        h_flex()
+            .id("tab-bar")
+            .w_full()
+            .flex_shrink_0()
+            .h(px(30.))
+            .gap_1()
+            .px_2()
+            .items_center()
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(theme.secondary)
+            .overflow_x_scroll()
+            .children(self.tabs.iter().enumerate().map(|(index, tab)| {
+                let active = index == self.active_tab;
+                let label = short_label(&tab.path);
+                let title = if tab.dirty {
+                    format!("● {label}（未保存）")
+                } else {
+                    label.clone()
+                };
+
+                h_flex()
+                    .id(("tab", index))
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .py_0p5()
+                    .rounded(theme.radius)
+                    .cursor_pointer()
+                    .text_xs()
+                    .bg(if active {
+                        theme.background
+                    } else {
+                        theme.secondary
+                    })
+                    .text_color(if active {
+                        theme.foreground
+                    } else {
+                        theme.muted_foreground
+                    })
+                    .hover(|style| style.bg(theme.accent.opacity(0.12)))
+                    .child(title)
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.switch_tab(index, window, cx)),
+                    )
+                    .child(
+                        div()
+                            .id(("tab-close", index))
+                            .px_1()
+                            .rounded(theme.radius)
+                            .hover(|style| style.bg(theme.danger.opacity(0.25)))
+                            .child("×")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                // 点 × 不该同时触发外层的「切到这个标签」
+                                cx.stop_propagation();
+                                this.close_tab(index, window, cx);
+                            })),
+                    )
+            }))
     }
 
     // ── 目录树 / 左栏 / 右侧主区 ─────────────────────────
@@ -2039,6 +2229,13 @@ impl Previewer {
     /// - `.md` → 右侧 Markdown 渲染（**可选中可复制**，位图预览做不到）
     /// - 其它文本 → 编辑器（右侧回到排版预览）
     fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        // 已开着的文件先查标签：切过去就行，**不能重读盘** ——
+        // 那会把标签里未保存的改动冲掉。
+        if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
+            self.switch_tab(index, window, cx);
+            return;
+        }
+
         if image_view::is_image_path(&path) {
             self.image = Some(cx.new(|cx| ImageView::new(path.clone(), cx)));
             self.right = RightPane::Image;
@@ -3148,6 +3345,7 @@ impl Render for Previewer {
                     cx.notify();
                 }),
             )
+            .child(self.render_tabs(cx))
             .child(
                 Input::new(&self.editor)
                     .bordered(false)
@@ -3424,6 +3622,13 @@ fn short_path(path: &str) -> String {
         1 => parts[0].to_string(),
         n => format!("{}/{}", parts[n - 2], parts[n - 1]),
     }
+}
+
+/// 标签上显示的名字（只要文件名）。
+fn short_label(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| short_path(&path.to_string_lossy()))
 }
 
 /// 右栏的「还没内容」占位（纯文本，无按钮）。

@@ -35,6 +35,7 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 | L11 | AI 编辑（选中文字 → Ctrl+K → 逐块 diff → 应用） | ✅ `crates/app/src/{ai,diff}.rs` + 浮层接线 |
 | L12 | 交互式终端（alacritty_terminal + PowerShell，Ctrl+4） | ✅ `crates/app/src/{terminal,terminal_view,term_colors}.rs` |
 | L13 | 工具栏补齐 `wu` 全部条目（26 按钮 + 9 色 + AI 下拉）· 状态栏合成一行贴底 | ✅ `crates/app/src/markup.rs` 扩到 29 个条目 |
+| L14 | 标签页（多文件切换，切换时重编）· 可拖动分区 · 预览适应宽度 · 编辑区去边框 | ✅ `Tab` + `h_resizable` + `zoom_fit` |
 
 - 28 个 commit，8000 行 Rust（36 个 `.rs` 文件），clippy 与 `cargo fmt` 都干净
 - 远端：`github.com/deviswu/typst-engine`（public，`master`，SSH）—— `git push` 即可
@@ -58,11 +59,15 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 
 ## 下一步（按我的推荐排序）
 
-0. **终端还没验的部分**：键盘输入 → pty（`TerminalElement` 里那套按键编码是照搬
+0. **标签页的第二版**（等真有体感再说）：现在切标签**重新编译**（引擎入口是单份的）。
+   要让每个标签各自持有排版结果，得把引擎从「单入口」改成多入口
+   （`EntryState` / `success_doc` / `SourceDb` 按文件分家）—— 这是真架构改动，
+   **先量出切标签到底多慢再决定**（小文档 0–20 ms，45 页约 200 ms）。
+1. **终端还没验的部分**：键盘输入 → pty（`TerminalElement` 里那套按键编码是照搬
    `wu` 的）、鼠标选中复制、面板高度可拖。自检只验到了「pty 通、网格能读回、
    面板能画」；剩下的得人点。
 1. **首次排版的过程感**
-1. **首次排版的过程感**（承接上一条）—— 现在只是「推迟 + 一行提示」。177 页要 854 ms，
+2. **首次排版的过程感**（承接上一条）—— 现在只是「推迟 + 一行提示」。177 页要 854 ms，
    可以先把第一页排出来先显示（需要把 `typst::compile` 换成按页/分段的办法，
    或者给首屏用 syntax-only 骨架）—— **先写能复现慢编译的测试再动**。
 2. **下载包时的进度** —— `typst-kit` 有 `ProgressDownloader`（带回调）。
@@ -121,6 +126,9 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 | 编到一半报「拒绝访问 typst-live.exe」 | 上一次 `cargo run` 的窗口还开着，文件被占 | `taskkill /F /IM typst-live.exe` 再编 |
 | **按钮文字溢到邻居身上（看着像重叠）** | flex 行默认 `flex-shrink: 1`，容器一窄就把子项压得比文字还窄 | 每个按钮/指标加 `flex_shrink_0`（与页框那次同一个坑，这次是**全应用**补） |
 | 工具栏挤成一团、还盖到预览上 | 工具栏挂在 520px 宽的编辑区列里，26 个按钮必然溢出 | 工具栏提到外层 v_flex，**全宽一条** |
+| 点标签的 `×` 会把标签也切一下 | 点击事件冒泡到外层标签（它也有 on_click） | 子元素里先 `cx.stop_propagation()` |
+| `no method named on_click found for Div` | gpui 的 `on_click` 在 `StatefulInteractiveElement` 上，元素得有 `id` | 先 `.id(("tab", index))` |
+| `ResizablePanelGroup` 上不能 `.flex_1()` | 它没实现 `Styled`，但自己的 render 里已经 `size_full + flex_1` | 直接当 flex 子项放 |
 | 右键示例文档报波浪线 | 我写成了 Markdown 的 `**粗体**`，Typst 是 `*...*` | — |
 
 **子代理（AgentShell）在这台机器上能不能用**（2026-09-16 实测，别再重复试）：
