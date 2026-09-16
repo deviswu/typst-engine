@@ -21,7 +21,8 @@ use gpui_component::highlighter::{
     Diagnostic as Squiggle, DiagnosticSeverity, LanguageConfig, LanguageRegistry,
 };
 use gpui_component::input::{Input, InputEvent, InputState, Position};
-use gpui_component::{ActiveTheme as _, Root, RopeExt as _, h_flex, v_flex};
+use gpui_component::select::{Select, SelectEvent, SelectState};
+use gpui_component::{ActiveTheme as _, IndexPath, Root, RopeExt as _, h_flex, v_flex};
 
 use typst::diag::SourceDiagnostic;
 use typst::foundations::Bytes;
@@ -33,10 +34,12 @@ use typst_engine::world::{EngineWorld, EntryState, embedded_and_system_fonts};
 use typst_layout::PagedDocument;
 
 use settings::Settings;
+use themes::ThemeItem;
 
 mod coords;
 mod finder;
 mod settings;
+mod themes;
 
 actions!(
     typst_live,
@@ -284,6 +287,13 @@ struct Previewer {
     /// 现在编辑的是「用户的文件」而不是内置示例 ——
     /// 只有它才值得记进设置里的「上次打开的文件」。
     explicit_file: bool,
+    /// 当前主题名。**刻意与 `settings.theme` 分开**：后者是「已经写进磁盘的
+    /// 那一份」，前者是「现在想要的」。混用一个字段的话，`save_settings` 里
+    /// 「变了才写」的比较永远相等 —— 界面换了主题、磁盘上却没写（踩过）。
+    theme_name: Option<String>,
+    /// 状态栏那个主题下拉框。
+    theme_select: Entity<SelectState<Vec<ThemeItem>>>,
+    _theme_sub: Subscription,
     status: Status,
     _sub: Subscription,
 }
@@ -326,6 +336,30 @@ impl Previewer {
                 this.on_editor_change(cx);
             }
         });
+
+        // 设置里记着上次用的主题就先装上（没有就保持 gpui-component 的默认）
+        let theme_name = settings.theme.clone();
+        if let Some(name) = settings.theme.clone() {
+            match themes::apply(&name, window, cx) {
+                Some(dark) => println!("[typst-live] {} 主题 {name}", describe_theme(dark, cx)),
+                None => println!("[typst-live] 设置里的主题 {name:?} 不在注册表里，继续用默认"),
+            }
+        }
+
+        // 主题下拉框。列表在启动时抓一次：主题文件改了要重启才看得见。
+        let current_theme = cx.theme().theme_name().to_string();
+        let theme_items = ThemeItem::all(&current_theme, cx);
+        let theme_path = ThemeItem::index_of(&theme_items).map(|row| IndexPath::default().row(row));
+        let theme_select = cx.new(|cx| SelectState::new(theme_items, theme_path, window, cx));
+        let theme_sub = cx.subscribe_in(
+            &theme_select,
+            window,
+            |this, _, event: &SelectEvent<Vec<ThemeItem>>, window, cx| {
+                let SelectEvent::Confirm(name) = event;
+                let Some(name) = name else { return };
+                this.use_theme(name.to_string(), window, cx);
+            },
+        );
 
         // 快速打开的查询框。做成常驻的（不是每次开关都新建）——
         // 开关只是切一个可见性标志，不涉及 entity 与订阅的生死。
@@ -390,6 +424,9 @@ impl Previewer {
             settings_dirty: false,
             settings_writes: 0,
             explicit_file,
+            theme_name,
+            theme_select,
+            _theme_sub: theme_sub,
             status: Status::default(),
             _sub: sub,
         };
@@ -624,6 +661,23 @@ impl Previewer {
         );
     }
 
+    /// 切到某个主题并记住它。
+    fn use_theme(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        match themes::apply(&name, window, cx) {
+            Some(dark) => {
+                println!("[typst-live] 切主题：{} → {name}", describe_theme(dark, cx));
+                self.message = Some(format!("主题 → {name}"));
+                self.theme_name = Some(name);
+                self.touch_settings(cx);
+            }
+            None => {
+                self.message = Some(format!("不认识的主题：{name}"));
+                println!("[typst-live] 不认识的主题：{name}");
+            }
+        }
+        cx.notify();
+    }
+
     // ── 设置持久化 ────────────────────────────────────
 
     /// 状态变了 → 起一个计时器，停下来之后再写盘。
@@ -643,18 +697,21 @@ impl Previewer {
         .detach();
     }
 
-    /// 把「现在的状态」与「已经写下去的那份」比一比，变了才写。
-    ///
-    /// 只覆盖自己管得住的那几项（窗口/文件/缩放）—— 主题那两项由主题那块
-    /// 自己写，这里原样带着，免得互相抹掉。
-    fn save_settings(&mut self, cx: &mut Context<Self>) {
-        self.settings_dirty = false;
-
+    /// 当前状态「应该写成什么」。
+    fn desired_settings(&self) -> Settings {
         let mut next = self.settings.clone();
         next.window = self.pending_window.or(next.window);
         next.file = self.explicit_file.then(|| self.main_path.clone());
         next.zoom = Some(self.zoom);
+        next.theme = self.theme_name.clone();
+        next
+    }
 
+    /// 把「现在想要的」与「已经写下去的那份」比一比，变了才写。
+    fn save_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_dirty = false;
+
+        let next = self.desired_settings();
         if next == self.settings {
             return;
         }
@@ -1176,6 +1233,13 @@ impl Previewer {
             info = info.child(div().text_color(theme.primary).child(msg.clone()));
         }
 
+        // 主题下拉框放最右（它是个交互控件，不适合夹在数字中间）
+        info = info.child(
+            div()
+                .ml_auto()
+                .child(Select::new(&self.theme_select).w(px(180.))),
+        );
+
         v_flex().w_full().child(bar).child(info)
     }
 
@@ -1696,6 +1760,21 @@ impl Render for Previewer {
                 this.set_zoom_anchored(next, cx);
             }))
     }
+}
+
+/// 主题那行日志的正文。
+///
+/// 带上背景色的 **hsl 数字**：光看「切成了深色」是自我报告，
+/// 数字才能证明真的换了（浅色主题的 l 接近 1，深色接近 0）。
+fn describe_theme(dark: bool, cx: &App) -> String {
+    let bg = cx.theme().background;
+    format!(
+        "{}（背景 hsl {:.3} {:.3} {:.3}）",
+        if dark { "深色" } else { "浅色" },
+        bg.h,
+        bg.s,
+        bg.l
+    )
 }
 
 /// 载入要编辑的文档：命令行参数 > 设置里的上次文件 > 内置示例。

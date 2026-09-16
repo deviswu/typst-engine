@@ -43,9 +43,10 @@ pub struct Settings {
     pub file: Option<PathBuf>,
     pub zoom: Option<f32>,
     /// 主题名（gpui-component 的 `ThemeRegistry` 里的名字）。
+    ///
+    /// 亮/暗不用单独存：`Theme::apply_config` 会把配置放进对应那一侧，
+    /// 名字本身就带着模式（`ThemeConfig.mode`）—— 存两份迟早会不一致。
     pub theme: Option<String>,
-    /// 深色模式。
-    pub dark: Option<bool>,
 }
 
 impl Settings {
@@ -96,24 +97,9 @@ impl Settings {
 
             match key.trim() {
                 "window" => out.window = parse_window(value),
-                "file" => {
-                    if !value.is_empty() {
-                        out.file = Some(PathBuf::from(value));
-                    }
-                }
+                "file" if !value.is_empty() => out.file = Some(PathBuf::from(value)),
                 "zoom" => out.zoom = value.parse::<f32>().ok().filter(|z| z.is_finite()),
-                "theme" => {
-                    if !value.is_empty() {
-                        out.theme = Some(value.to_owned());
-                    }
-                }
-                "dark" => {
-                    out.dark = match value {
-                        "1" | "true" | "yes" => Some(true),
-                        "0" | "false" | "no" => Some(false),
-                        _ => None,
-                    }
-                }
+                "theme" if !value.is_empty() => out.theme = Some(value.to_owned()),
                 _ => {}
             }
         }
@@ -136,9 +122,6 @@ impl Settings {
         }
         if let Some(theme) = &self.theme {
             out.push_str(&format!("theme={theme}\n"));
-        }
-        if let Some(dark) = self.dark {
-            out.push_str(&format!("dark={}\n", u8::from(dark)));
         }
 
         out
@@ -168,7 +151,6 @@ mod tests {
             file: Some(PathBuf::from("/tmp/docs/报告.typ")),
             zoom: Some(1.25),
             theme: Some("Default Dark".to_owned()),
-            dark: Some(true),
         }
     }
 
@@ -204,7 +186,7 @@ mod tests {
 
         assert_eq!(settings.window, None, "解析不了就别当设置");
         assert_eq!(settings.file, None, "空路径等于没设");
-        assert_eq!(settings.dark, None);
+        assert_eq!(settings.theme, None, "`dark` 这种旧键认不出就跳过");
         assert_eq!(settings.zoom, Some(2.0), "后面那行好的该生效");
     }
 
@@ -230,7 +212,7 @@ mod tests {
     fn absent_items_produce_no_lines() {
         let text = Settings::default().render();
 
-        for key in ["window=", "file=", "zoom=", "theme=", "dark="] {
+        for key in ["window=", "file=", "zoom=", "theme="] {
             assert!(!text.contains(key), "空的设置不该写 `{key}`：{text:?}");
         }
     }

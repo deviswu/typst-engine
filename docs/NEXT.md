@@ -28,8 +28,10 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 | L4 | 语法服务：大纲 / 诊断 / 字数 | ✅（高亮仍走 tree-sitter） |
 | L5 | GPUI 外壳 | ✅ |
 | L6 | 跳转索引（源码字节 ⇄ 页/页内 pt） | ✅ `crates/engine/src/jump.rs` + 外壳双击接入 |
+| L7 | 外壳体验：设置持久化 · 链接可点 · 主题切换 | ✅ `crates/app/src/{settings,themes,coords}.rs` |
 
-- 22 个 commit，6615 行 Rust（32 个 `.rs` 文件），clippy 与 `cargo fmt` 都干净
+- 26 个 commit，约 7400 行 Rust（35 个 `.rs` 文件），clippy 与 `cargo fmt` 都干净
+- 远端：`github.com/deviswu/typst-engine`（public，`master`，SSH）—— `git push` 即可
 - 远端：`github.com/deviswu/typst-engine`（public，`master`，SSH）—— 已推完，`git push` 即可
 - 依赖只有 crates.io 官方 `typst 0.15.1`，无 git fork
 
@@ -50,22 +52,18 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 
 ## 下一步（按我的推荐排序）
 
-1. **设置持久化** —— 窗口尺寸/位置、最近文件、当前缩放。小工作量、体感提升大
-   （每次开窗都要重新调大小）。
-2. **把坐标换算抽成纯函数 + 单测** —— `window_to_page_pt` / `page_pt_to_window`
-   目前只被临时自检覆盖过（自检已删）。那个「内容坐标 vs 窗口坐标」的坑
-   只在预览滚过时才现形，锁进 `cargo test` 才能防复发。半小时的活。
-3. **工具栏** —— `wu` 有：标题 / 加粗 / 对齐 / 颜色 / 上下标 / 公式 / 图片 /
+1. **工具栏** —— `wu` 有：标题 / 加粗 / 对齐 / 颜色 / 上下标 / 公式 / 图片 /
    表格 / 分页 一键插入。中等工作量，纯 UI。
-4. **长文档首屏** —— 45 页冷编译 222 ms。可考虑：先出第一页再后台排完，
+2. **长文档首屏** —— 45 页冷编译 222 ms。可考虑：先出第一页再后台排完，
    或对首屏用 syntax-only 先给个骨架。
-5. **`@preview` 联网下载** —— 引擎的 `Packages` 目前只认本地包目录。
+3. **`@preview` 联网下载** —— 引擎的 `Packages` 目前只认本地包目录。
    要用 `typst-kit::packages::SystemPackages` + `SystemDownloader`（spec §9 R4 已查清）。
-6. **主题切换** —— gpui-component 自带多套主题，接一下就行。
 
-想做的还有（都小）：预览里的链接可点（`FrameItem::Link`，索引里已经在手边）、
-索引改按页惰性建（22 ms → 0.5 ms 级，**只有真感觉到卡顿才做**）、
-双击只跳转不选词（一行 `stop_propagation`）。
+想做的还有（都小）：索引改按页惰性建（22 ms → 0.5 ms 级，**只有真感觉到卡顿才做**）、
+双击只跳转不选词（一行 `stop_propagation`）、主题列表改成读 `themes/` 目录
+（`ThemeRegistry::watch_dir`，现在只在启动时抓一次）。
+
+刚做完（不要再提）：坐标换算单测、设置持久化、预览链接可点、主题切换。
 
 ## 已论证「不做」（别重新捡起来）
 
@@ -90,6 +88,9 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 | 中文文档建跳转索引时 panic | `Glyph.span` 里那个 `u16` 偏移可能落在字符中间 | 对齐到字符边界取整个字符 |
 | 跳转到错的行 | 排版失败时预览是旧结果而源码已变，字节偏移对不上 | 编译失败期间禁用跳转 |
 | 大纲 106 ms（超一帧） | `line_of` 每个标题都从文本开头数换行 = O(n²) | 一次性建行首索引 + 二分 |
+| **窗口每开一次往下爬 11px** | 存的是 `window.bounds()`（客户区）而不是 `window_bounds()` | 存后者（下次开窗用的就是那一份几何） |
+| **换了主题、磁盘上没写** | 「现在想要的」与「已经存盘的那份」混用一个字段，「变了才写」的比较永远相等 | 分开存（`theme_name` vs `settings.theme`） |
+| `#[test]` 报 recursion limit | 文件里 `use gpui::*` 把 gpui 自己的 `#[gpui::test]`（名字就叫 `test`）带进来了 | 那个文件只引要用的类型，不要通配符 |
 | 右键示例文档报波浪线 | 我写成了 Markdown 的 `**粗体**`，Typst 是 `*...*` | — |
 
 **通用教训**：多窗口桌面上截图对比不可靠（会被别的窗口挡住/干扰），
