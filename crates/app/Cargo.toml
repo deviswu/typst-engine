@@ -1,0 +1,24 @@
+[package]
+name = "typst-live"
+version.workspace = true
+edition.workspace = true
+description = "typst-engine 的 GPUI 外壳：实时 Typst 预览器"
+
+[[bin]]
+name = "typst-live"
+path = "src/main.rs"
+
+[dependencies]
+# gpui 版本锁定：与 wu / jicheng 完全一致的组合（已在那些项目验证过）
+gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["font-kit"] }
+gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "1505b1487131adbb443f6c69e87847db35bfa2d1" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "1505b1487131adbb443f6c69e87847db35bfa2d1" }
+
+# 引擎
+typst-engine = { path = "../engine" }
+typst = { workspace = true }
+typst-layout = { workspace = true }
+
+# 编辑器里的 Typst 语法高亮（gpui-component 自带的语言集里没有 typst）
+codebook-tree-sitter-typst = "0.12.1"

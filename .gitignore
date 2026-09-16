@@ -9,3 +9,8 @@
 /tmp/
 *.pdf
 !tests/fixtures/**/*.pdf
+
+# 跑 GUI 时留下的东西
+/shot.png
+/app.err.log
+/app.out.log
