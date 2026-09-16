@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use typst::model::Destination;
 use typst::syntax::Source;
 use typst_engine::jump::LayoutIndex;
 use typst_engine::syntax as lang;
@@ -279,6 +280,39 @@ fn a_document_without_text_is_empty_not_a_panic() {
     assert_eq!(index.glyph_count(), 0, "这个文档一个字都没有");
     assert_eq!(index.forward(0), None);
     assert_eq!(index.inverse(0, 10.0, 10.0), None);
+}
+
+#[test]
+fn a_link_is_indexed_with_its_url_and_box() {
+    let (source, doc) = layout("#link(\"https://example.com/a=b\")[点这里]\n");
+    let index = LayoutIndex::build(&doc, &source);
+
+    let links = index.links(0);
+    assert_eq!(links.len(), 1, "该刚好一个链接：{links:?}");
+
+    let Destination::Url(url) = &links[0].dest else {
+        panic!("该是 URL 链接：{:?}", links[0].dest);
+    };
+    assert_eq!(url.as_str(), "https://example.com/a=b");
+
+    // 链接框该盖住那段文字：拿字形的中心去验
+    let byte = source.text().find('点').unwrap();
+    let anchor = index.forward(byte).expect("该有字形");
+    let (cx, cy) = anchor.center();
+    let [x0, y0, x1, y1] = links[0].rect;
+    assert!(
+        cx >= x0 && cx <= x1 && cy >= y0 && cy <= y1,
+        "链接框 {links:?} 该盖住 {anchor:?}"
+    );
+}
+
+#[test]
+fn documents_without_links_have_none() {
+    let (source, doc) = layout("正文，没有任何链接。\n");
+    let index = LayoutIndex::build(&doc, &source);
+
+    assert!(index.links(0).is_empty());
+    assert!(index.links(99).is_empty(), "页号越界该给空切片而不是 panic");
 }
 
 /// 两个方向都要在**一帧之内**：跳转是交互动作，卡一下就能感觉到。

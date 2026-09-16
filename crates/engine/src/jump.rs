@@ -38,6 +38,8 @@
 //! - **别的文件**（`#include` 进来的）：span 指向的不是主文件，直接跳过 ——
 //!   外壳手上只有主文件的文本，跳过去也没有意义
 //! - **图/线/形状**：不建索引（点击落在它们身上时走「就近吸附」兜底）
+//! - **链接**：单独存一份矩形（`links()`），外壳用它做 Ctrl+单击打开；
+//!   文档内部的 `Location` 链接暂时只报「不支持」
 //! - **没有字形的源码**（`#set`、注释、未渲染的 `#let`）：前向查找退化成
 //!   「就近吸附」——这是有意的，跳到一个附近的位置比什么都不做有用
 
@@ -45,6 +47,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use typst::layout::{Frame, FrameItem, Transform};
+use typst::model::Destination;
 use typst::syntax::{DiagSpan, Source, Span};
 use typst_layout::PagedDocument;
 
@@ -111,6 +114,15 @@ impl GlyphBox {
     }
 }
 
+/// 一个可点区域（链接）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkBox {
+    /// 页内 pt 矩形 `[x0, y0, x1, y1]`，y 向下。
+    pub rect: [f32; 4],
+    /// 指向哪里：外链（`Url`）或文档内位置。
+    pub dest: Destination,
+}
+
 /// 前向查找的索引项：按字节起点排序。
 #[derive(Debug, Clone, Copy)]
 struct Slot {
@@ -124,6 +136,9 @@ struct Slot {
 pub struct LayoutIndex {
     /// 每页的字形框，页内顺序 = 绘制顺序。
     pages: Vec<Vec<GlyphBox>>,
+    /// 每页的链接框。字与链接分开存：两者查找方式完全不同
+    /// （字靠字节二分，链接靠点内判定）。
+    links: Vec<Vec<LinkBox>>,
     /// 按字节起点排序的全表，前向查找用。
     slots: Vec<Slot>,
     /// `slots[..=i]` 里最大的字节终点。前向查找靠它**精确**判断
@@ -141,10 +156,12 @@ impl LayoutIndex {
         let mut ctx = Build::new(source);
 
         let mut pages = Vec::with_capacity(doc.pages().len());
+        let mut links = Vec::with_capacity(doc.pages().len());
         for page in doc.pages() {
-            let mut glyphs = Vec::new();
-            walk(&page.frame, Affine::IDENTITY, &mut ctx, &mut glyphs);
-            pages.push(glyphs);
+            let mut out = PageOut::default();
+            walk(&page.frame, Affine::IDENTITY, &mut ctx, &mut out);
+            pages.push(out.glyphs);
+            links.push(out.links);
         }
 
         let mut slots: Vec<Slot> = Vec::with_capacity(pages.iter().map(Vec::len).sum());
@@ -173,6 +190,7 @@ impl LayoutIndex {
 
         Self {
             pages,
+            links,
             slots,
             max_end,
         }
@@ -281,6 +299,13 @@ impl LayoutIndex {
         Some(glyph.anchor(page))
     }
 
+    /// 某一页上的链接（矩形已含 Group 变换）。
+    ///
+    /// 外壳拿它做「Ctrl+单击打开链接」。页号越界给空切片，不 panic。
+    pub fn links(&self, page: usize) -> &[LinkBox] {
+        self.links.get(page).map_or(&[], Vec::as_slice)
+    }
+
     fn glyph(&self, slot: Slot) -> &GlyphBox {
         &self.pages[slot.page as usize][slot.glyph as usize]
     }
@@ -298,6 +323,13 @@ impl LayoutIndex {
 }
 
 // ── 遍历排版结果 ──────────────────────────────────────────────
+
+/// 一页上收集到的东西。
+#[derive(Debug, Default)]
+struct PageOut {
+    glyphs: Vec<GlyphBox>,
+    links: Vec<LinkBox>,
+}
 
 /// 二维仿射（pt，y 向下）：`x' = a·x + c·y + e`，`y' = b·x + d·y + f`。
 ///
@@ -363,12 +395,14 @@ impl Affine {
         )
     }
 
-    /// 把「文本项局部坐标」里的一个矩形映射到页面坐标，返回它的外接框。
+    /// 把「条目局部坐标」里的一个矩形映射到页面坐标，返回它的外接框。
     ///
-    /// 绝大部分文字只有平移（没有旋转/倾斜），那条路径直接算两个角 ——
+    /// 字形框与链接框走同一个函数：两者都是「在帧里占一块矩形」。
+    ///
+    /// 绝大部分内容只有平移（没有旋转/倾斜），那条路径直接算两个角 ——
     /// 建索引是**每个字形**都要走一遍的事，这里是热路径。
     /// （`b` / `c` 就是旋转与倾斜分量，与 `Transform` 的 `ky` / `kx` 对应。）
-    fn glyph_rect(self, x0: f32, x1: f32, top: f32, bottom: f32) -> Option<[f32; 4]> {
+    fn map_rect(self, x0: f32, x1: f32, top: f32, bottom: f32) -> Option<[f32; 4]> {
         if self.b == 0.0 && self.c == 0.0 {
             let (ax0, ay0) = (self.a * x0 + self.e, self.d * top + self.f);
             let (ax1, ay1) = (self.a * x1 + self.e, self.d * bottom + self.f);
@@ -469,7 +503,7 @@ impl<'a> Build<'a> {
 ///
 /// 变换的累积方式与 `typst-render` 的 `State::pre_translate` /
 /// `pre_concat` 完全一致（同一套复合顺序），所以坐标对得上渲染结果。
-fn walk(frame: &Frame, acc: Affine, ctx: &mut Build<'_>, out: &mut Vec<GlyphBox>) {
+fn walk(frame: &Frame, acc: Affine, ctx: &mut Build<'_>, out: &mut PageOut) {
     for (pos, item) in frame.items() {
         let placed = Affine::translate(pos.x.to_pt() as f32, pos.y.to_pt() as f32);
         match item {
@@ -509,11 +543,11 @@ fn walk(frame: &Frame, acc: Affine, ctx: &mut Build<'_>, out: &mut Vec<GlyphBox>
 
                     let top = -rise - ascent;
                     let bottom = -rise + descent;
-                    let Some(rect) = aff.glyph_rect(x0, x1, top, bottom) else {
+                    let Some(rect) = aff.map_rect(x0, x1, top, bottom) else {
                         continue;
                     };
 
-                    out.push(GlyphBox {
+                    out.glyphs.push(GlyphBox {
                         x0: rect[0],
                         y0: rect[1],
                         x1: rect[2],
@@ -533,7 +567,24 @@ fn walk(frame: &Frame, acc: Affine, ctx: &mut Build<'_>, out: &mut Vec<GlyphBox>
                     walk(&group.frame, child, ctx, out);
                 }
             }
-            // 形状 / 图片 / 链接 / 标签：不建索引（见模块头的「已知取舍」）
+            // 链接：一个矩形 + 一个去向。字与链接分开存 ——
+            // 前者按字节二分，后者按点内判定，查询方式完全不同。
+            FrameItem::Link(dest, size) => {
+                let aff = acc.then(placed);
+                if !aff.is_finite() {
+                    continue;
+                }
+                let Some(rect) =
+                    aff.map_rect(0.0, size.x.to_pt() as f32, 0.0, size.y.to_pt() as f32)
+                else {
+                    continue;
+                };
+                out.links.push(LinkBox {
+                    rect,
+                    dest: dest.clone(),
+                });
+            }
+            // 形状 / 图片 / 标签：不建索引（见模块头的「已知取舍」）
             _ => {}
         }
     }
@@ -625,11 +676,14 @@ mod tests {
     fn inverse_of_a_page_that_does_not_exist_is_none() {
         let index = LayoutIndex {
             pages: vec![Vec::new()],
+            links: vec![Vec::new()],
             slots: Vec::new(),
             max_end: Vec::new(),
         };
 
         assert_eq!(index.inverse(3, 10.0, 10.0), None);
         assert_eq!(index.inverse(0, f32::NAN, 0.0), None, "非有限坐标不算数");
+        assert!(index.links(0).is_empty());
+        assert!(index.links(7).is_empty(), "空的索引问哪一页都该是空切片");
     }
 }

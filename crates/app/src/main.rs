@@ -25,14 +25,18 @@ use gpui_component::{ActiveTheme as _, Root, RopeExt as _, h_flex, v_flex};
 
 use typst::diag::SourceDiagnostic;
 use typst::foundations::Bytes;
+use typst::model::Destination;
 use typst_engine::export::{RasterPage, pdf as export_pdf, pixel_per_pt_for_zoom, rasterize_page};
 use typst_engine::jump::{Anchor, LayoutIndex};
 use typst_engine::syntax as lang;
 use typst_engine::world::{EngineWorld, EntryState, embedded_and_system_fonts};
 use typst_layout::PagedDocument;
 
+use settings::Settings;
+
 mod coords;
 mod finder;
+mod settings;
 
 actions!(
     typst_live,
@@ -65,6 +69,12 @@ const MAX_SCAN_FILES: usize = 5000;
 
 /// 快速打开列表里最多显示多少条。
 const MAX_QUICK_MATCHES: usize = 50;
+
+/// 设置写盘前的等待时长。
+///
+/// 拖动窗口时尺寸每帧都在变 —— 变一次写一次盘（一秒几十次）太吵。
+/// 所以是**防抖**：状态一变就重置计时器，停下来之后才写。
+const SETTINGS_DEBOUNCE: Duration = Duration::from_millis(400);
 
 /// 可见范围外再预出几页。留 1 页是为了滚动时不会先看到空白。
 const PAGE_PREFETCH: usize = 1;
@@ -127,6 +137,7 @@ $ integral_0^infinity e^(-x^2) dif x = sqrt(pi)/2 $
 左边的光标会移到那句话上。两边都会留下一个会淡出的框。
 
 + `Ctrl+Alt+J` 也能做前向跳转（不用鼠标）
++ 预览里的链接用 *Ctrl+单击* 打开，比如 #link("https://typst.app")[Typst 官网]
 + 跳转靠的是排版结果里的字形出处，所以跳一次只需重新出图：
   状态栏的「排版次数」不会变
 "#;
@@ -261,6 +272,18 @@ struct Previewer {
     /// 不当场做，而是等这一轮事件走完再在 `render` 里做 —— 那时
     /// 编辑器已经把光标挪到点击处了，读到的位置才是准的。
     pending_forward: bool,
+    /// 从磁盘读来的设置（同时也是「已经写下去的那一份」——
+    /// 每次保存成功后都会用新的快照替掉它，所以「变没变」一比就知道）。
+    settings: Settings,
+    /// 窗口几何变了、但还没写盘。
+    pending_window: Option<settings::WindowBox>,
+    /// 有未落盘的改动。
+    settings_dirty: bool,
+    /// 设置写盘次数（日志里的证据）。
+    settings_writes: usize,
+    /// 现在编辑的是「用户的文件」而不是内置示例 ——
+    /// 只有它才值得记进设置里的「上次打开的文件」。
+    explicit_file: bool,
     status: Status,
     _sub: Subscription,
 }
@@ -269,6 +292,8 @@ impl Previewer {
     fn new(
         source: String,
         main_path: PathBuf,
+        explicit_file: bool,
+        settings: Settings,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -330,7 +355,8 @@ impl Previewer {
             main_path,
             editor,
             doc: None,
-            zoom: 1.0,
+            // 上次的缩放从设置里恢复（还要夹一次，手改过的设置可能越界）
+            zoom: settings.zoom.unwrap_or(1.0).clamp(ZOOM_MIN, ZOOM_MAX),
             scale_factor: window.scale_factor(),
             outline: Vec::new(),
             compile_errors: Vec::new(),
@@ -359,6 +385,11 @@ impl Previewer {
             flash: None,
             flash_seq: 0,
             pending_forward: false,
+            settings,
+            pending_window: None,
+            settings_dirty: false,
+            settings_writes: 0,
+            explicit_file,
             status: Status::default(),
             _sub: sub,
         };
@@ -593,6 +624,55 @@ impl Previewer {
         );
     }
 
+    // ── 设置持久化 ────────────────────────────────────
+
+    /// 状态变了 → 起一个计时器，停下来之后再写盘。
+    ///
+    /// 同时存在多个计时器也无所谓：它们做的都是同一件事（把当前状态写下去），
+    /// 而且 gpui 的任务都在同一线程上跑，不会写坏文件。
+    fn touch_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_dirty = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SETTINGS_DEBOUNCE).await;
+            _ = this.update(cx, |this, cx| {
+                if this.settings_dirty {
+                    this.save_settings(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 把「现在的状态」与「已经写下去的那份」比一比，变了才写。
+    ///
+    /// 只覆盖自己管得住的那几项（窗口/文件/缩放）—— 主题那两项由主题那块
+    /// 自己写，这里原样带着，免得互相抹掉。
+    fn save_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_dirty = false;
+
+        let mut next = self.settings.clone();
+        next.window = self.pending_window.or(next.window);
+        next.file = self.explicit_file.then(|| self.main_path.clone());
+        next.zoom = Some(self.zoom);
+
+        if next == self.settings {
+            return;
+        }
+        match next.save() {
+            Ok(()) => {
+                self.settings_writes += 1;
+                println!(
+                    "[typst-live] 设置已写：{}（第 {} 次）",
+                    settings::path().display(),
+                    self.settings_writes
+                );
+                self.settings = next;
+            }
+            Err(err) => println!("[typst-live] 设置写不进去：{err}"),
+        }
+        cx.notify();
+    }
+
     fn set_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
         let zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
         if (zoom - self.zoom).abs() < f32::EPSILON {
@@ -601,6 +681,8 @@ impl Previewer {
         self.zoom = zoom;
         // 只重做出图，不重新排版 —— 这就是缩放能任意清晰的原因。
         self.rerasterize();
+        // 缩放是要记住的（下次开窗应该还是这个大小）
+        self.touch_settings(cx);
         cx.notify();
     }
 
@@ -870,6 +952,39 @@ impl Previewer {
         Some(point(px(wx), px(wy)))
     }
 
+    /// Ctrl+单击：点在链接上就打开它。
+    ///
+    /// 为什么加 Ctrl：普通单击不能直接开浏览器 —— 双击跳转的**第一次点击**
+    /// 也会先报一次 `click_count == 1`，那就会把链接顺手开掉。
+    fn open_link_at(&mut self, page: usize, x: f32, y: f32, cx: &mut Context<Self>) {
+        self.rebuild_index();
+
+        // 先把命中结果收成自有数据，再做副作用 —— 不然索引的借用与
+        // `self.message = ...` 的可变借用会打架。
+        let hit = self.index.as_ref().and_then(|cache| {
+            cache
+                .index
+                .links(page)
+                .iter()
+                .find(|link| {
+                    x >= link.rect[0] && x <= link.rect[2] && y >= link.rect[1] && y <= link.rect[3]
+                })
+                .cloned()
+        });
+
+        self.message = Some(match hit.map(|link| link.dest) {
+            Some(Destination::Url(url)) => {
+                let url = url.as_str().to_owned();
+                println!("[typst-live] 打开链接：{url}");
+                cx.open_url(&url);
+                format!("打开 {url}")
+            }
+            Some(_) => "这是文档内部的链接，暂时打不开（目前只支持网址）".to_owned(),
+            None => "这里没有链接".to_owned(),
+        });
+        cx.notify();
+    }
+
     /// 在某一页留下一块会淡出的高亮。
     ///
     /// 跨页跳过去之后，没有这个框人得自己找位置 —— 它是「跳过去了」的
@@ -955,6 +1070,9 @@ impl Previewer {
         // 换文档：字体留着，入口 / 覆盖层 / 源缓存 / 上次成功结果都重置。
         self.engine.reopen(&self.root, &full);
         self.main_path = full;
+        // 打开的是用户自己的文件 —— 从此它就是「上次打开的文件」
+        self.explicit_file = true;
+        self.touch_settings(cx);
         self.doc = None;
         self.bitmaps.clear();
         self.texture_bytes = 0;
@@ -1312,7 +1430,26 @@ impl Render for Previewer {
             self.rerasterize();
         }
 
-        // 下面两项都要 `&mut cx`，而 `cx.theme()` 是不可变借用 ——
+        // 窗口尺寸/位置变了就记下来（拖动时会变很多次，所以写盘是防抖的）。
+        //
+        // ★ 用 `window_bounds()` 而不是 `bounds()`：前者就是「下次开窗该用哪份
+        // 几何」，与我们交给 `WindowOptions` 的是同一个坐标系；`bounds()` 报的是
+        // **客户区**，比请求值差一个非客户区高度（本机实测 **+11px**）——
+        // 拿它存下来，窗口每开一次就在屏幕上往下爬 11px。
+        if let WindowBounds::Windowed(rect) = window.window_bounds() {
+            let boxed = (
+                rect.origin.x.as_f32() as i32,
+                rect.origin.y.as_f32() as i32,
+                rect.size.width.as_f32() as i32,
+                rect.size.height.as_f32() as i32,
+            );
+            if self.pending_window != Some(boxed) {
+                self.pending_window = Some(boxed);
+                self.touch_settings(cx);
+            }
+        }
+
+        // 下面几项都要 `&mut cx`，而 `cx.theme()` 是不可变借用 ——
         // 所以它们必须放在拿 theme 之前（这个坑在 NEXT.md 里记着）。
         //
         // 按当前视口补出/卸载纹理。内部只在可见范围真的变了才动手，
@@ -1417,17 +1554,22 @@ impl Render for Previewer {
                             // **容器永远不会溢出，滚轮因此没有任何东西可滚**，
                             // 而且视口光栅化会误以为「全部页都可见」而把纹理全出出来。
                             .flex_shrink_0()
-                            // 双击这一页 → 光标跳到对应的源码处
+                            // 双击这一页 → 光标跳到对应的源码处；
+                            // Ctrl+单击 → 打开链接
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                                    if ev.click_count < 2 {
-                                        return;
-                                    }
                                     let Some((x, y)) = this.window_to_page_pt(ev.position, i)
                                     else {
                                         return;
                                     };
+                                    if ev.click_count == 1 && ev.modifiers.control {
+                                        this.open_link_at(i, x, y, cx);
+                                        return;
+                                    }
+                                    if ev.click_count < 2 {
+                                        return;
+                                    }
                                     this.jump_to_source(i, x, y, window, cx);
                                 }),
                             )
@@ -1556,18 +1698,23 @@ impl Render for Previewer {
     }
 }
 
-/// 载入要编辑的文档：有参数就用它，否则用内置示例。
-fn load_document(arg: Option<String>) -> (String, PathBuf) {
-    if let Some(raw) = arg {
-        let path = PathBuf::from(&raw);
+/// 载入要编辑的文档：命令行参数 > 设置里的上次文件 > 内置示例。
+///
+/// 第三个返回值是「这是不是用户自己的文件」—— 只有它值得记进设置里的
+/// 「上次打开的文件」（内置示例落在临时目录，记下来没有意义）。
+fn load_document(arg: Option<String>, remembered: Option<&Path>) -> (String, PathBuf, bool) {
+    let candidates = arg
+        .map(PathBuf::from)
+        .into_iter()
+        .chain(remembered.map(Path::to_path_buf));
+
+    for path in candidates {
         match std::fs::read_to_string(&path) {
             Ok(text) => {
                 println!("打开 {}", path.display());
-                return (text, path);
+                return (text, path, true);
             }
-            Err(err) => {
-                eprintln!("读不了 {raw}：{err}；改用内置示例文档");
-            }
+            Err(err) => eprintln!("读不了 {}：{err}", path.display()),
         }
     }
 
@@ -1575,11 +1722,21 @@ fn load_document(arg: Option<String>) -> (String, PathBuf) {
     // 引擎用的是内存覆盖层，这正是实时编译的前提。
     let path = std::env::temp_dir().join("typst-live-demo.typ");
     println!("使用内置示例文档（虚拟路径 {}）", path.display());
-    (DEMO_DOC.to_owned(), path)
+    (DEMO_DOC.to_owned(), path, false)
 }
 
 fn main() {
     let path_arg = std::env::args().nth(1);
+
+    // 设置先读：窗口开在哪儿、上次开的是哪个文件、上次缩放多少，都在这儿。
+    let settings = Settings::load();
+    println!(
+        "[typst-live] 读设置 {}：窗口 {:?}，缩放 {:?}，上次文件 {:?}",
+        settings::path().display(),
+        settings.window,
+        settings.zoom,
+        settings.file,
+    );
 
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
     app.run(move |cx| {
@@ -1610,22 +1767,39 @@ fn main() {
             KeyBinding::new("escape", QuickCancel, Some("QuickOpen")),
         ]);
 
-        let (source, path) = load_document(path_arg);
+        let (source, path, explicit_file) = load_document(path_arg, settings.file.as_deref());
+        let restore = settings.clone();
 
         cx.spawn(async move |cx| {
+            // 上次的窗口几何。逻辑像素取整存过，回来时直接用。
+            let bounds = restore.window.map_or_else(
+                || {
+                    Bounds::new(
+                        point(px(80.), px(60.)),
+                        Size {
+                            width: px(1320.),
+                            height: px(880.),
+                        },
+                    )
+                },
+                |(x, y, w, h)| {
+                    Bounds::new(
+                        point(px(x as f32), px(y as f32)),
+                        Size {
+                            width: px(w as f32),
+                            height: px(h as f32),
+                        },
+                    )
+                },
+            );
+
             let options = WindowOptions {
                 titlebar: Some(TitlebarOptions {
                     title: Some("typst-engine · 实时预览".into()),
                     appears_transparent: false,
                     traffic_light_position: None,
                 }),
-                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-                    point(px(80.), px(60.)),
-                    Size {
-                        width: px(1320.),
-                        height: px(880.),
-                    },
-                ))),
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(Size {
                     width: px(900.),
                     height: px(600.),
@@ -1635,8 +1809,18 @@ fn main() {
 
             let source = source.clone();
             let path = path.clone();
+            let settings = restore.clone();
             cx.open_window(options, move |window, cx| {
-                let view = cx.new(|cx| Previewer::new(source.clone(), path.clone(), window, cx));
+                let view = cx.new(|cx| {
+                    Previewer::new(
+                        source.clone(),
+                        path.clone(),
+                        explicit_file,
+                        settings.clone(),
+                        window,
+                        cx,
+                    )
+                });
                 cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
             })
             .expect("打开窗口失败");
