@@ -25,7 +25,7 @@ use gpui_component::{ActiveTheme as _, Root, h_flex, v_flex};
 
 use typst::diag::SourceDiagnostic;
 use typst::foundations::Bytes;
-use typst_engine::export::{RasterPage, pdf as export_pdf, pixel_per_pt_for_zoom, rasterize};
+use typst_engine::export::{RasterPage, pdf as export_pdf, pixel_per_pt_for_zoom, rasterize_page};
 use typst_engine::syntax as lang;
 use typst_engine::world::{EngineWorld, EntryState, embedded_and_system_fonts};
 use typst_layout::PagedDocument;
@@ -62,6 +62,9 @@ const MAX_SCAN_FILES: usize = 5000;
 
 /// 快速打开列表里最多显示多少条。
 const MAX_QUICK_MATCHES: usize = 50;
+
+/// 可见范围外再预出几页。留 1 页是为了滚动时不会先看到空白。
+const PAGE_PREFETCH: usize = 1;
 
 const DEMO_DOC: &str = r#"#set page(width: 15cm, height: auto, margin: 1.8cm)
 #set text(size: 11pt)
@@ -174,8 +177,16 @@ struct Previewer {
     quick_selected: usize,
     quick_visible: bool,
     _quick_sub: Subscription,
-    /// 光栅化产物（GPU 纹理）。每次排版或缩放后重建。
-    bitmaps: Vec<Arc<RenderImage>>,
+    /// 每页的光栅化纹理。`None` = 还没出图（或已被视口卸载）。
+    ///
+    /// **不一次性光栅化全部页**：A4 单页在 100% 下就 7.7 MiB，
+    /// 100 页就是 770 MiB；400% 时每页 54 MiB。现在只留可见的几页。
+    bitmaps: Vec<Option<Arc<RenderImage>>>,
+    /// 每页的**逻辑**尺寸（宽, 高）。布局靠它，不靠纹理 ——
+    /// 所以某一页没出图时占位尺寸依旧正确，滚动位置与翻页都不受影响。
+    page_sizes: Vec<(f32, f32)>,
+    /// 当前已经出图的页范围（含），用于判断「要不要重新同步」。
+    live_range: Option<(usize, usize)>,
     /// 预览滚动区的句柄。翻页就是把某一页滚到顶部。
     scroll: ScrollHandle,
     /// 当前页（0 起）。翻页与缩放后回锚都靠它。
@@ -272,6 +283,8 @@ impl Previewer {
             quick_visible: false,
             _quick_sub: quick_sub,
             bitmaps: Vec::new(),
+            page_sizes: Vec::new(),
+            live_range: None,
             scroll: ScrollHandle::new(),
             current_page: 0,
             texture_bytes: 0,
@@ -396,30 +409,109 @@ impl Previewer {
     }
 
     /// 从已排版的 `doc` 重新出图。**不碰编译器**。
+    /// 排版或缩放变了 —— 重建页尺寸并丢掉全部纹理，等下一帧按视口重新出图。
+    ///
+    /// **不再一次性光栅化全部页**。原因：A4 单页在 100% 下就占 7.7 MiB 纹理，
+    /// 100 页就是 770 MiB；400% 时每页 54 MiB，直接爆。现在只出可见的几页。
     fn rerasterize(&mut self) {
         let Some(doc) = self.doc.clone() else {
             self.bitmaps.clear();
+            self.page_sizes.clear();
+            self.texture_bytes = 0;
+            self.live_range = None;
             return;
         };
 
+        // 页的**逻辑**尺寸（布局用）。它等于 pt × 96/72 × zoom ——
+        // 屏幕缩放系数在这里恰好抵消，因为逻辑尺寸本就不该依赖显示器。
+        let base = typst_engine::export::BASE_PIXEL_PER_PT * self.zoom;
+        self.page_sizes = doc
+            .pages()
+            .iter()
+            .map(|p| {
+                let s = p.frame.size();
+                (s.x.to_pt() as f32 * base, s.y.to_pt() as f32 * base)
+            })
+            .collect();
+
+        // 全部丢成「未光栅化」占位。布局靠 page_sizes，不靠纹理，
+        // 所以占位不会让页面尺寸变化 —— 滚到底、翻页、跳大纲都不受影响。
+        self.bitmaps = vec![None; self.page_sizes.len()];
+        self.texture_bytes = 0;
+        self.live_range = None;
+    }
+
+    /// 按当前视口把该出图的页出了，把不该留的丢掉。
+    ///
+    /// 只在**可见页范围真的变了**的时候动手 —— 滚动过程中每帧都重算
+    /// 会让滚动发涩。
+    fn sync_visible_pages(&mut self) {
+        let Some(doc) = self.doc.clone() else {
+            return;
+        };
+        let count = doc.pages().len();
+        if count == 0 || self.bitmaps.len() != count {
+            return;
+        }
+
+        // `top_item`/`bottom_item` 是 gpui 给的「当前滚进视口的子项下标」——
+        // 我们的子项恰好就是页。还没布局时它们安全地返回 0。
+        let first = self.scroll.top_item().min(count - 1);
+        let last = self.scroll.bottom_item().min(count - 1);
+        let lo = first.saturating_sub(PAGE_PREFETCH);
+        let hi = (last + PAGE_PREFETCH).min(count - 1);
+
+        self.current_page = first;
+        if self.live_range == Some((lo, hi)) {
+            return;
+        }
+        self.live_range = Some((lo, hi));
+
         let ppp = pixel_per_pt_for_zoom(self.zoom) * self.scale_factor;
         let t = Instant::now();
-        let pages = rasterize(&doc, ppp);
-        self.status.raster_ms = t.elapsed().as_secs_f64() * 1000.0;
-        self.status.rasters += 1;
+        let mut rasterized = 0usize;
+        let mut dropped = 0usize;
 
-        let total: usize = pages.iter().map(|p| p.rgba.len()).sum();
-        self.texture_bytes = total;
-        self.bitmaps = pages.into_iter().filter_map(to_texture).collect();
+        // ① 卸载：范围外的纹理丢掉（这是显存真正被释放的地方）
+        for (i, slot) in self.bitmaps.iter_mut().enumerate() {
+            if (i < lo || i > hi) && slot.is_some() {
+                *slot = None;
+                dropped += 1;
+            }
+        }
 
+        // ② 补缺：范围内还没出图的页
+        for i in lo..=hi {
+            if self.bitmaps[i].is_some() {
+                continue;
+            }
+            let texture = to_texture(rasterize_page(&doc.pages()[i], ppp));
+            self.bitmaps[i] = texture;
+            rasterized += 1;
+        }
+
+        if rasterized > 0 || dropped > 0 {
+            self.status.raster_ms = t.elapsed().as_secs_f64() * 1000.0;
+            self.status.rasters += 1;
+        }
+        self.texture_bytes = self
+            .bitmaps
+            .iter()
+            .flatten()
+            .map(|b| {
+                let s = b.size(0);
+                s.width.0 as usize * s.height.0 as usize * 4
+            })
+            .sum();
+
+        let live = self.bitmaps.iter().filter(|b| b.is_some()).count();
         println!(
-            "[typst-live] 光栅化 {} 页 @ {:.0}% × 屏缩放 {:.2}（{:.2} px/pt）：{:.1} ms，纹理共 {:.1} MiB",
-            self.bitmaps.len(),
-            self.zoom * 100.0,
-            self.scale_factor,
-            ppp,
+            "[typst-live] 视口 {}–{} 页 / 共 {count}：新出图 {rasterized}，卸载 {dropped}；\
+             常驻纹理 {live} 页 {:.1} MiB，用时 {:.1} ms",
+            lo + 1,
+            hi + 1,
+            self.texture_bytes as f64 / (1024.0 * 1024.0),
             self.status.raster_ms,
-            total as f64 / (1024.0 * 1024.0),
         );
     }
 
@@ -661,7 +753,12 @@ impl Previewer {
                 "{:.0} MiB",
                 self.texture_bytes as f64 / (1024.0 * 1024.0)
             ))
-            .child(format!("{} 页", self.status.pages))
+            .child(if self.status.pages == 0 {
+                "0 页".to_string()
+            } else {
+                // 跟着滚动走 —— 滚轮翻页时这个数字会跟着变
+                format!("第 {} / {} 页", self.current_page + 1, self.status.pages)
+            })
             .child(
                 div()
                     .text_color(theme.primary)
@@ -959,6 +1056,10 @@ impl Render for Previewer {
         let theme = cx.theme();
         let has_errors = !self.compile_errors.is_empty();
 
+        // 按当前视口补出/卸载纹理。内部只在可见范围真的变了才动手，
+        // 所以滚动过程中每帧调它是安全的（就是两次二分查找）。
+        self.sync_visible_pages();
+
         let outline_pane = self.render_outline(cx);
 
         let editor_pane = div()
@@ -969,7 +1070,17 @@ impl Render for Previewer {
             .border_color(theme.border)
             .child(Input::new(&self.editor).h_full());
 
-        // 纹理已是最终分辨率，按 1:1 显示即可 —— 缩放倍率已经体现在像素数里。
+        // 布局尺寸一律用 `page_sizes`（按 pt 算出来的），**不用纹理的像素尺寸**。
+        // 两者能对上（纹理 = pt × ppp，逻辑 = 纹理 / 屏缩放 = pt × 96/72 × zoom），
+        // 但用前者才能保证「某一页还没出图」时页面尺寸不变 —— 否则
+        // 滚动条会在滚到新页的瞬间跳一下。
+        let page_rows: Vec<(f32, f32, Option<Arc<RenderImage>>)> = (0..self.bitmaps.len())
+            .map(|i| {
+                let (w, h) = self.page_sizes.get(i).copied().unwrap_or((0.0, 0.0));
+                (w, h, self.bitmaps[i].clone())
+            })
+            .collect();
+
         let pages = v_flex()
             .id("pages")
             .flex_1()
@@ -980,18 +1091,44 @@ impl Render for Previewer {
             .gap_5()
             .py_5()
             .items_center()
-            .children(self.bitmaps.iter().map(|bitmap| {
-                let size = bitmap.size(0);
-                // 纹理是**物理像素**，而布局用的是**逻辑像素** —— 除回缩放系数
-                // 就是 1:1 映射，一个物理像素对一个物理像素，字才不发虚。
-                let logical_w = size.width.0 as f32 / self.scale_factor;
-                let logical_h = size.height.0 as f32 / self.scale_factor;
-                div().bg(gpui::white()).shadow_md().overflow_hidden().child(
-                    img(ImageSource::Render(bitmap.clone()))
-                        .w(px(logical_w))
-                        .h(px(logical_h)),
-                )
-            }));
+            .children(
+                page_rows
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (w, h, texture))| {
+                        let inner = match texture {
+                            // 纹理是**物理像素**，而布局用的是**逻辑像素** —— 除回缩放系数
+                            // 就是 1:1 映射，一个物理像素对一个物理像素，字才不发虚。
+                            Some(texture) => img(ImageSource::Render(texture))
+                                .w(px(w))
+                                .h(px(h))
+                                .into_any_element(),
+                            // 占位：尺寸一样，所以不牵动布局；只是还没出图
+                            None => div()
+                                .w(px(w))
+                                .h(px(h))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_sm()
+                                .text_color(gpui::black().opacity(0.18))
+                                .child(format!("第 {} 页", i + 1))
+                                .into_any_element(),
+                        };
+                        div()
+                            .bg(gpui::white())
+                            .shadow_md()
+                            .overflow_hidden()
+                            .w(px(w))
+                            .h(px(h))
+                            // ★ 必须禁掉收缩：flex 列容器默认 `flex-shrink: 1`，
+                            // 会把超出视口高度的页全压扁塞进来 —— 结果是
+                            // **容器永远不会溢出，滚轮因此没有任何东西可滚**，
+                            // 而且视口光栅化会误以为「全部页都可见」而把纹理全出出来。
+                            .flex_shrink_0()
+                            .child(inner)
+                    }),
+            );
 
         let preview_pane = if has_errors {
             v_flex()
