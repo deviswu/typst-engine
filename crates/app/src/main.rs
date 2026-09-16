@@ -3169,6 +3169,56 @@ impl Previewer {
 
 impl Render for Previewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // AI 评审阶段把焦点拿到浮层上：gpui 的动作派发**从聚焦节点开始**，
+        // 没有焦点就没有起点（NEXT.md 里那个坑：所有快捷键静默失效）。
+        if self.ai.stage == AiStage::Review && !self.ai_focus.is_focused(window) {
+            self.ai_focus.focus(window, cx);
+        }
+
+        // 首次排版**推迟到这一帧画完之后**再跑：先让窗口出现（带一句
+        // 「首次排版中…」），别让用户盯着一个还没画出来的窗口等 200+ ms。
+        if self.first_compile {
+            self.first_compile = false;
+            println!("[typst-live] 首帧 @{:.0} ms（窗口已画）", since_start_ms());
+            cx.spawn(async move |this, cx| {
+                // 让出一轮执行器，确保这一帧真的画出去了再排
+                cx.background_executor().timer(Duration::ZERO).await;
+                _ = this.update(cx, |this, cx| {
+                    println!("[typst-live] 首次排版 @{:.0} ms", since_start_ms());
+                    this.recompile(cx);
+                    println!(
+                        "[typst-live] 首次排版完成：{:.1} ms（{} 页）@{:.0} ms",
+                        this.status.compile_ms,
+                        this.status.pages,
+                        since_start_ms()
+                    );
+                });
+            })
+            .detach();
+        }
+
+        // 窗口尺寸/位置变了就记下来（拖动时会变很多次，所以写盘是防抖的）。
+        //
+        // ★ 用 `window_bounds()` 而不是 `bounds()`：前者就是「下次开窗该用哪份
+        // 几何」，与我们交给 `WindowOptions` 的是同一个坐标系；`bounds()` 报的是
+        // **客户区**，比请求值差一个非客户区高度（本机实测 **+11px**）——
+        // 拿它存下来，窗口每开一次就在屏幕上往下爬 11px。
+        if let WindowBounds::Windowed(rect) = window.window_bounds() {
+            let boxed = (
+                rect.origin.x.as_f32() as i32,
+                rect.origin.y.as_f32() as i32,
+                rect.size.width.as_f32() as i32,
+                rect.size.height.as_f32() as i32,
+            );
+            if self.pending_window != Some(boxed) {
+                self.pending_window = Some(boxed);
+                self.touch_settings(cx);
+            }
+        }
+
+        // 下面几项都要 `&mut cx`，而 `cx.theme()` 是不可变借用 ——
+        // 所以它们必须放在拿 theme 之前（这个坑在 NEXT.md 里记着）。
+        //
         // 开机报一次布局：窗口多宽、三块分区各多宽
         self.report_layout_once(window, cx);
 
