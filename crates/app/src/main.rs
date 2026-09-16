@@ -114,6 +114,13 @@ struct Previewer {
     zoom: f32,
     /// 光栅化产物（GPU 纹理）。每次排版或缩放后重建。
     bitmaps: Vec<Arc<RenderImage>>,
+    /// 当前纹理共占多少字节。用来把显存开销直接显示给用户。
+    texture_bytes: usize,
+    /// 上一次已排版的文本。
+    ///
+    /// gpui-component 的 `InputEvent::Change` 不止在文字变化时发出
+    /// （光标移动、选中也会），不挡一下就会白排一遍。
+    last_text: String,
     status: Status,
     _sub: Subscription,
 }
@@ -151,7 +158,7 @@ impl Previewer {
 
         let sub = cx.subscribe_in(&editor, window, |this, _, event, _window, cx| {
             if matches!(event, InputEvent::Change) {
-                this.recompile(cx);
+                this.on_editor_change(cx);
             }
         });
 
@@ -162,11 +169,23 @@ impl Previewer {
             doc: None,
             zoom: 1.0,
             bitmaps: Vec::new(),
+            texture_bytes: 0,
+            last_text: String::new(),
             status: Status::default(),
             _sub: sub,
         };
+        // 首次编译不走守卫：文本为空也该先把世界建起来。
         this.recompile(cx);
         this
+    }
+
+    /// 编辑器内容变化。**先挡一道**：内容没真的变就不排版。
+    fn on_editor_change(&mut self, cx: &mut Context<Self>) {
+        let text = self.editor.read(cx).value().to_string();
+        if text == self.last_text {
+            return;
+        }
+        self.recompile(cx);
     }
 
     /// 一次完整的「编辑 → 重排版 → 重新出图」循环。
@@ -174,6 +193,7 @@ impl Previewer {
     /// 同步执行：排版只要几毫秒，开线程反而引入调度开销与状态同步的麻烦。
     fn recompile(&mut self, cx: &mut Context<Self>) {
         let text = self.editor.read(cx).value().to_string();
+        self.last_text = text.clone();
         let main_id = self.engine.entry().main();
 
         // ① 未保存文本进覆盖层
@@ -181,35 +201,45 @@ impl Previewer {
             .vfs_mut()
             .map_shadow(&self.main_path, Bytes::from_string(text.clone()));
         // ② 增量重解析（不是重建语法树）
-        let outcome = self.engine.sources().feed_memory(main_id, &text);
-
-        // ③ 排版
-        let t = Instant::now();
-        let result = typst::compile::<PagedDocument>(&self.engine);
-        self.status.compile_ms = t.elapsed().as_secs_f64() * 1000.0;
-        self.status.compiles += 1;
-
-        self.status.reparsed = outcome.reparsed.map(|r| r.len()).unwrap_or(0);
+        let fed = self.engine.sources().feed_memory(main_id, &text);
+        self.status.reparsed = fed.reparsed.map(|r| r.len()).unwrap_or(0);
         self.status.text_bytes = text.len();
 
-        match result.output {
-            Ok(doc) => {
-                let doc = Arc::new(doc);
+        // ③ 排版。「上一次成功的结果」由**引擎**记着 —— 失败时 `compiled.doc`
+        //    就是那份旧的，外壳不需要再自己维护一份副本。
+        let compiled = self.engine.compile();
+        self.status.compile_ms = compiled.elapsed.as_secs_f64() * 1000.0;
+        self.status.compiles = self.engine.compile_attempts();
+
+        match compiled.doc {
+            Some(doc) => {
                 self.status.pages = doc.pages().len();
+                // 只有文档真的换了才重新出图。失败时拿到的是同一个 Arc，
+                // 重新光栅化纯属浪费。
+                let changed = !self.doc.as_ref().is_some_and(|old| Arc::ptr_eq(old, &doc));
                 self.doc = Some(doc);
-                self.status.errors.clear();
+                if changed {
+                    self.rerasterize();
+                }
             }
-            Err(errors) => {
-                // 编译失败：**不动 doc**，右边继续显示上一次成功的结果。
-                self.status.errors = errors
-                    .iter()
-                    .take(6)
-                    .map(|e| e.message.to_string())
-                    .collect();
+            None => {
+                self.doc = None;
+                self.bitmaps.clear();
+                self.texture_bytes = 0;
             }
         }
 
-        self.rerasterize();
+        if compiled.fresh {
+            self.status.errors.clear();
+        } else {
+            self.status.errors = compiled
+                .errors
+                .iter()
+                .take(6)
+                .map(|e| e.message.to_string())
+                .collect();
+        }
+
         cx.notify();
     }
 
@@ -227,6 +257,7 @@ impl Previewer {
         self.status.rasters += 1;
 
         let total: usize = pages.iter().map(|p| p.rgba.len()).sum();
+        self.texture_bytes = total;
         self.bitmaps = pages.into_iter().filter_map(to_texture).collect();
 
         println!(
@@ -270,6 +301,10 @@ impl Previewer {
             .child(format!(
                 "重解析 {} B / {} B",
                 self.status.reparsed, self.status.text_bytes
+            ))
+            .child(format!(
+                "{:.0} MiB",
+                self.texture_bytes as f64 / (1024.0 * 1024.0)
             ))
             .child(format!("{} 页", self.status.pages))
             .child(

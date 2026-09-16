@@ -42,12 +42,12 @@ cargo run --example realtime   # 不开窗，在终端里跑逐字输入的性�
 |---|---|---|
 | L0 | 覆盖式 VFS（内存盖住磁盘 + revision 语义） | ✅ 完成 |
 | L1 | 增量 World（`SourceDb` / 字体 / 包 / `impl typst::World`） | ✅ 完成 |
-| L2 | 编译驱动（防抖 / 队列 / `success_doc` 不白屏） | ⏳ Plan 2 |
+| L2 | 编译驱动 | 🟡 **只做了最小版**：`success_doc` 失败保留已进引擎、「文本没变不重排」；actor 队列与防抖**刻意不做**（同步只要 0.5–2 ms，见 spec「刻意不做的事」） |
 | L3 | 导出：SVG 页 + **位图（可控 DPI / 缩放）** 已通 | 🟡 部分 |
 | L4 | 语法服务（高亮 / 大纲 / 折叠） | ⏳ Plan 3（编辑器高亮目前走 tree-sitter） |
 | L5 | GPUI 外壳（含 0.25×–4× 缩放） | ✅ `crates/app`（`typst-live`） |
 
-测试：**77 个全绿**（71 单测 + 6 集成），clippy 零警告。
+测试：**82 个全绿**（76 单测 + 6 集成），clippy 零警告。
 
 ### 预览：位图，不是 SVG
 
