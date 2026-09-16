@@ -27,8 +27,9 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 | L3 | 导出：SVG / 位图（可控 DPI）/ PDF | ✅ |
 | L4 | 语法服务：大纲 / 诊断 / 字数 | ✅（高亮仍走 tree-sitter） |
 | L5 | GPUI 外壳 | ✅ |
+| L6 | 跳转索引（源码字节 ⇄ 页/页内 pt） | ✅ `crates/engine/src/jump.rs` + 外壳双击接入 |
 
-- 19 个 commit，5296 行 Rust，41 个文件，clippy 干净
+- 21 个 commit，6615 行 Rust（32 个 `.rs` 文件），clippy 与 `cargo fmt` 都干净
 - **本地仓库，无远端** ← 最该先做的事
 - 依赖只有 crates.io 官方 `typst 0.15.1`，无 git fork
 
@@ -79,6 +80,9 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 | **所有快捷键静默失效** | `dispatch_action` 从**聚焦节点**开始派发；窗口没焦点就没有起点 | 启动时 `state.focus()` |
 | 预览发虚 | 光栅化没乘显示器 DPI 缩放（150% 屏上差 1.5 倍像素） | 出图 × scale_factor，布局 ÷ scale_factor |
 | **滚轮滚不动** | 页框没设 `flex_shrink_0`，被 flex 压进视口 → 容器永不溢出 | 页框加 `.flex_shrink_0()` |
+| **预览滚过之后，双击位置整页偏** | `ScrollHandle::bounds_for_item` 给的是**内容坐标**（不是窗口坐标），漏加滚动偏移 | 加回 `offset`；正反两个方向共用一对互逆函数 |
+| 中文文档建跳转索引时 panic | `Glyph.span` 里那个 `u16` 偏移可能落在字符中间 | 对齐到字符边界取整个字符 |
+| 跳转到错的行 | 排版失败时预览是旧结果而源码已变，字节偏移对不上 | 编译失败期间禁用跳转 |
 | 大纲 106 ms（超一帧） | `line_of` 每个标题都从文本开头数换行 = O(n²) | 一次性建行首索引 + 二分 |
 | 右键示例文档报波浪线 | 我写成了 Markdown 的 `**粗体**`，Typst 是 `*...*` | — |
 
@@ -91,5 +95,12 @@ cargo run --example realtime    # 终端的逐字输入性能数据
   在 `render()` 里用临时静态计数器 + `window.dispatch_action(...)` 派发
   （记得把临时块放在 `let theme = cx.theme()` **之前**，否则和 theme 的
   不可变借用冲突）。用完删干净。
+- 更进一步：**按帧号推进的自检**。在 `render()` 开头按 `FRAME.fetch_add(1)` 分步
+  做事（第 3 帧造光条件、第 5 帧报结果、第 7 帧 `cx.quit()`），能直接把真代码路径
+  走一遍。两个必要条件：① 每一步末尾要 `cx.notify()`，否则帧不会往前走、自检停在半路；
+  ② 自己 `cx.quit()` 关窗，不然它开在那儿不走了。跳转那两个方向就是这样验的（见 README）。
+- 验证坐标类逻辑时，**让断言用一条独立算式**（而不是复用被测函数）：
+  “目标行现在画在窗口 y=142.7px，期望 142.7px” 才抳出了那个
+  “内容坐标 / 窗口坐标” 的 bug；把同一个函数算两遍是抓不到错的。
 - 读剪贴板式的窗口截图：先 `SetProcessDpiAwarenessContext(-4)` 再
   `CopyFromScreen`，否则拿到的是被系统缩过的逻辑分辨率，看不出清晰度差异。

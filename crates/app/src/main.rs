@@ -14,18 +14,19 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui::*;
 use gpui_component::highlighter::{
     Diagnostic as Squiggle, DiagnosticSeverity, LanguageConfig, LanguageRegistry,
 };
 use gpui_component::input::{Input, InputEvent, InputState, Position};
-use gpui_component::{ActiveTheme as _, Root, h_flex, v_flex};
+use gpui_component::{ActiveTheme as _, Root, RopeExt as _, h_flex, v_flex};
 
 use typst::diag::SourceDiagnostic;
 use typst::foundations::Bytes;
 use typst_engine::export::{RasterPage, pdf as export_pdf, pixel_per_pt_for_zoom, rasterize_page};
+use typst_engine::jump::{Anchor, LayoutIndex};
 use typst_engine::syntax as lang;
 use typst_engine::world::{EngineWorld, EntryState, embedded_and_system_fonts};
 use typst_layout::PagedDocument;
@@ -50,6 +51,7 @@ actions!(
         QuickPrev,
         QuickNext,
         QuickCancel,
+        SyncToPreview,
     ]
 );
 
@@ -65,6 +67,17 @@ const MAX_QUICK_MATCHES: usize = 50;
 
 /// 可见范围外再预出几页。留 1 页是为了滚动时不会先看到空白。
 const PAGE_PREFETCH: usize = 1;
+
+/// 跳转后高亮淡出的时长。
+///
+/// 跨页跳过去之后，没有这个框人得自己找位置 —— 它是「跳过去了」的
+/// 唯一视觉证据。淡出而不是一直留着，是因为它是**一次性的**反馈，
+/// 不是「当前位置」的标记。
+const FLASH: Duration = Duration::from_millis(1400);
+
+/// 前向跳转时把目标行放在视口顶部往下多少逻辑像素处 ——
+/// 上面留一点，好看见「这是哪一段」。
+const SYNC_MARGIN: f32 = 80.0;
 
 const DEMO_DOC: &str = r#"#set page(width: 15cm, height: auto, margin: 1.8cm)
 #set text(size: 11pt)
@@ -106,6 +119,15 @@ $ integral_0^infinity e^(-x^2) dif x = sqrt(pi)/2 $
 只在下方列出错误，而不是变成一片空白。
 
 #let broken = (1 + 2)
+
+== 双击跳转
+
+*双击左边*的任意一行，右边会跳到它在哪一页；*双击右边*的任意一处，
+左边的光标会移到那句话上。两边都会留下一个会淡出的框。
+
++ `Ctrl+Alt+J` 也能做前向跳转（不用鼠标）
++ 跳转靠的是排版结果里的字形出处，所以跳一次只需重新出图：
+  状态栏的「排版次数」不会变
 "#;
 
 fn register_typst_language() {
@@ -135,6 +157,25 @@ struct Status {
     compiles: usize,
     /// 光栅化次数。缩放**会**让它增加。
     rasters: usize,
+}
+
+/// 跳转索引 + 它是为哪一份排版结果建的。
+///
+/// `Arc` 指针相同就说明排版结果没换，索引可以直接用 —— 于是
+/// **缩放、滚动、翻页都不会重建索引**：它们只碰光栅化那一层。
+struct IndexCache {
+    doc: Arc<PagedDocument>,
+    index: LayoutIndex,
+}
+
+/// 跳转落点上的一小块高亮。
+struct Flash {
+    page: usize,
+    /// 页内 pt 矩形 `[x0, y0, x1, y1]`。
+    rect: [f32; 4],
+    /// 递增序号。它同时是元素的 id：换了序号才会重新挂载，
+    /// 淡出动画也才会从头播（同 id 的元素会复用上一次的动画状态）。
+    seq: usize,
 }
 
 struct Previewer {
@@ -198,6 +239,27 @@ struct Previewer {
     /// gpui-component 的 `InputEvent::Change` 不止在文字变化时发出
     /// （光标移动、选中也会），不挡一下就会白排一遍。
     last_text: String,
+    /// 跳转索引（源码 ⇄ 显示区）。**惰性构建**：只在真的要跳的时候建。
+    index: Option<IndexCache>,
+    /// 上一次排版**是否成功**。
+    ///
+    /// 失败时预览显示的是上一次成功的结果，而源码已经改了 ——
+    /// 两边的字节素引就对不上，所以那段时间里跳转要关掉，
+    /// 否则会把人送到错的行上（宁可说「现在跳不了」）。
+    index_usable: bool,
+    /// 索引构建次数与耗时。状态栏那两个数就是「索引是第三层」的证据：
+    /// 缩放时只有光栅化在涨。
+    index_builds: usize,
+    index_ms: f64,
+    /// 跳转留下的高亮。
+    flash: Option<Flash>,
+    /// 高亮序号，自增。
+    flash_seq: usize,
+    /// 双击编辑区后要做的前向跳转。
+    ///
+    /// 不当场做，而是等这一轮事件走完再在 `render` 里做 —— 那时
+    /// 编辑器已经把光标挪到点击处了，读到的位置才是准的。
+    pending_forward: bool,
     status: Status,
     _sub: Subscription,
 }
@@ -289,6 +351,13 @@ impl Previewer {
             current_page: 0,
             texture_bytes: 0,
             last_text: String::new(),
+            index: None,
+            index_usable: false,
+            index_builds: 0,
+            index_ms: 0.0,
+            flash: None,
+            flash_seq: 0,
+            pending_forward: false,
             status: Status::default(),
             _sub: sub,
         };
@@ -334,6 +403,14 @@ impl Previewer {
         let compiled = self.engine.compile();
         self.status.compile_ms = compiled.elapsed.as_secs_f64() * 1000.0;
         self.status.compiles = self.engine.compile_attempts();
+
+        // 排版结果换了 → 跳转索引作废（下次真的跳的时候再惰性重建）。
+        //
+        // 失败时索引**不能用**：预览留在屏幕上的是上一次成功的排版，
+        // 而源码已经改了 —— 两边的字节偏移对不上，跳过去就是错的行。
+        self.index = None;
+        self.index_usable = compiled.fresh;
+        self.flash = None;
 
         match compiled.doc {
             Some(doc) => {
@@ -630,6 +707,182 @@ impl Previewer {
         cx.notify();
     }
 
+    // ── 双向跳转（双击）──────────────────────────────────────
+
+    /// 按需建索引，并按**排版结果**缓存。
+    ///
+    /// 「排版 → 索引 → 光栅化」三层里中间那层的全部实现就在这里：
+    /// 排版结果没换（`Arc` 指针相同）就直接复用，所以**缩放、滚动、
+    /// 翻页都不会重建它**。状态栏的「索引 N 次」会把这件事直接显示出来。
+    fn rebuild_index(&mut self) {
+        let Some(doc) = self.doc.clone() else { return };
+        if self
+            .index
+            .as_ref()
+            .is_some_and(|c| Arc::ptr_eq(&c.doc, &doc))
+        {
+            return;
+        }
+        if !self.index_usable {
+            // 上一次排版没成功：预览里是旧结果，源码已经变了，对不上。
+            return;
+        }
+        let Ok(source) = typst::World::source(&self.engine, self.engine.entry().main()) else {
+            return;
+        };
+
+        let started = Instant::now();
+        let index = LayoutIndex::build(&doc, &source);
+        self.index_ms = started.elapsed().as_secs_f64() * 1000.0;
+        self.index_builds += 1;
+
+        println!(
+            "[typst-live] 建跳转索引：{} 页 / {} 个字形，用时 {:.1} ms（第 {} 次）",
+            index.page_count(),
+            index.glyph_count(),
+            self.index_ms,
+            self.index_builds,
+        );
+        self.index = Some(IndexCache { doc, index });
+    }
+
+    /// 源码第 `byte` 个字节 → 显示区的位置。
+    fn forward_anchor(&mut self, byte: usize) -> Option<Anchor> {
+        self.rebuild_index();
+        self.index.as_ref()?.index.forward(byte)
+    }
+
+    /// 显示区第 `page` 页的 `(x, y)` pt → 源码的位置。
+    fn inverse_anchor(&mut self, page: usize, x: f32, y: f32) -> Option<Anchor> {
+        self.rebuild_index();
+        self.index.as_ref()?.index.inverse(page, x, y)
+    }
+
+    /// 显示区 → 编辑区：把光标放到那一处。
+    ///
+    /// `set_cursor_position` 内部会 focus 并滚到光标上，所以不需要
+    /// 我们管编辑器的滚动。
+    fn jump_to_source(
+        &mut self,
+        page: usize,
+        x: f32,
+        y: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(anchor) = self.inverse_anchor(page, x, y) else {
+            self.message = Some(format!("第 {} 页这里没有可定位的文字", page + 1));
+            cx.notify();
+            return;
+        };
+
+        let rope = self.editor.read(cx).text().clone();
+        let position = rope.offset_to_position(anchor.byte.start);
+        let line = position.line + 1;
+        self.editor.update(cx, |state, cx| {
+            state.set_cursor_position(position, window, cx);
+        });
+
+        println!(
+            "[typst-live] 反向跳转：第 {} 页 ({x:.1}, {y:.1}) pt → 第 {line} 行（字节 {}..{}）",
+            anchor.page + 1,
+            anchor.byte.start,
+            anchor.byte.end,
+        );
+        self.flash_on(anchor.page, anchor.rect, cx);
+        self.message = Some(format!(
+            "显示区 → 第 {line} 行（第 {} 页）",
+            anchor.page + 1
+        ));
+        cx.notify();
+    }
+
+    /// 编辑区 → 显示区：把光标所在处滚进预览。
+    fn jump_to_preview(&mut self, cx: &mut Context<Self>) {
+        let byte = self.editor.read(cx).cursor();
+        let Some(anchor) = self.forward_anchor(byte) else {
+            self.message = Some(
+                if self.doc.is_none() {
+                    "还没排过版，没地方可跳"
+                } else if self.index_usable {
+                    "这一份文档里没有可定位的文字"
+                } else {
+                    "上一次排版没成功，跳转暂时关掉（预览是旧结果）"
+                }
+                .to_owned(),
+            );
+            cx.notify();
+            return;
+        };
+
+        // 页内 pt → 逻辑像素 → 窗口坐标。
+        //
+        // 页框位置直接问 `ScrollHandle` 要，而不是自己把上面所有页的高度
+        // 加起来 —— 那样得同时算对页间距、内边距、缩放，迟早会错位。
+        if let Some(now) = self.page_pt_to_window(anchor.page, anchor.rect[0], anchor.rect[1]) {
+            let viewport = self.scroll.bounds();
+            let desired = viewport.origin.y + px(SYNC_MARGIN);
+            let offset = self.scroll.offset();
+            self.scroll
+                .set_offset(point(offset.x, offset.y + (desired - now.y)));
+        }
+        self.current_page = anchor.page;
+
+        let rope = self.editor.read(cx).text().clone();
+        let line = rope.offset_to_position(anchor.byte.start).line + 1;
+        println!(
+            "[typst-live] 前向跳转：第 {line} 行（字节 {byte}）→ 第 {} 页，页内 y={:.1} pt",
+            anchor.page + 1,
+            anchor.rect[1],
+        );
+        self.flash_on(anchor.page, anchor.rect, cx);
+        self.message = Some(format!("第 {line} 行 → 第 {} 页", anchor.page + 1));
+        cx.notify();
+    }
+
+    /// 窗口坐标 → 页内 pt。
+    ///
+    /// `bounds_for_item` 给的是**内容坐标**（`ScrollHandle::top_item` 用的
+    /// 就是同一套）：要加回滚动偏移才是真正画在窗口里的位置。
+    /// 不带偏移的话，预览一旦滚过，点击就会偏出整页 —— 错得很隐蔽。
+    fn window_to_page_pt(&self, position: Point<Pixels>, page: usize) -> Option<(f32, f32)> {
+        let bounds = self.scroll.bounds_for_item(page)?;
+        let offset = self.scroll.offset();
+        let local = point(
+            position.x - bounds.origin.x - offset.x,
+            position.y - bounds.origin.y - offset.y,
+        );
+        let base = pixel_per_pt_for_zoom(self.zoom);
+        Some((local.x.as_f32() / base, local.y.as_f32() / base))
+    }
+
+    /// 页内 pt → 窗口坐标（`window_to_page_pt` 的反函数）。
+    ///
+    /// 前向跳转靠它算出「目标现在画在哪」，再据此定新的滚动偏移。
+    fn page_pt_to_window(&self, page: usize, x: f32, y: f32) -> Option<Point<Pixels>> {
+        let bounds = self.scroll.bounds_for_item(page)?;
+        let offset = self.scroll.offset();
+        let base = pixel_per_pt_for_zoom(self.zoom);
+        Some(point(
+            bounds.origin.x + px(x * base) + offset.x,
+            bounds.origin.y + px(y * base) + offset.y,
+        ))
+    }
+
+    /// 在某一页留下一块会淡出的高亮。
+    ///
+    /// 跨页跳过去之后，没有这个框人得自己找位置 —— 它是「跳过去了」的
+    /// 唯一视觉证据。
+    fn flash_on(&mut self, page: usize, rect: [f32; 4], cx: &mut Context<Self>) {
+        self.flash_seq += 1;
+        self.flash = Some(Flash {
+            page,
+            rect,
+            seq: self.flash_seq,
+        });
+        cx.notify();
+    }
+
     // ── 快速跳转（Ctrl+P）────────────────────────────────────────────
 
     /// Ctrl+P：扫描项目目录并弹出快速打开。
@@ -745,6 +998,11 @@ impl Previewer {
                     .child(format!("排版 {:.1} ms", self.status.compile_ms)),
             )
             .child(format!("光栅化 {:.1} ms", self.status.raster_ms))
+            .child(if self.index_builds == 0 {
+                "索引 —".to_owned()
+            } else {
+                format!("索引 {:.1} ms", self.index_ms)
+            })
             .child(format!(
                 "重解析 {} B / {} B",
                 self.status.reparsed, self.status.text_bytes
@@ -765,8 +1023,8 @@ impl Previewer {
                     .child(format!("缩放 {:.0}%", self.zoom * 100.0)),
             )
             .child(format!(
-                "排版 {} 次 / 光栅化 {} 次",
-                self.status.compiles, self.status.rasters
+                "排版 {} 次 / 光栅化 {} 次 / 索引 {} 次",
+                self.status.compiles, self.status.rasters, self.index_builds
             ));
 
         // 第二行：文档信息 + 保存状态 + 一次性反馈。
@@ -1053,12 +1311,22 @@ impl Render for Previewer {
             self.rerasterize();
         }
 
-        let theme = cx.theme();
-        let has_errors = !self.compile_errors.is_empty();
-
+        // 下面两项都要 `&mut cx`，而 `cx.theme()` 是不可变借用 ——
+        // 所以它们必须放在拿 theme 之前（这个坑在 NEXT.md 里记着）。
+        //
         // 按当前视口补出/卸载纹理。内部只在可见范围真的变了才动手，
         // 所以滚动过程中每帧调它是安全的（就是两次二分查找）。
         self.sync_visible_pages();
+
+        // 双击编辑区后的前向跳转。放在 render 里而不是鼠标回调里，
+        // 是因为此刻编辑器已经把光标放到点击处了 —— 读到的位置才准。
+        if self.pending_forward {
+            self.pending_forward = false;
+            self.jump_to_preview(cx);
+        }
+
+        let theme = cx.theme();
+        let has_errors = !self.compile_errors.is_empty();
 
         let outline_pane = self.render_outline(cx);
 
@@ -1068,6 +1336,22 @@ impl Render for Previewer {
             .flex_shrink_0()
             .border_r_1()
             .border_color(theme.border)
+            // 双击编辑区 → 显示区。
+            //
+            // **不阻止事件**：编辑器自己的「双击选词」照常发生，
+            // 两件事互不干扰（选中的词也会一并被前向跳转命中）。
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, _window, cx| {
+                    if ev.click_count < 2 {
+                        return;
+                    }
+                    // 不当场跳：等这一轮事件跑完，编辑器把光标挪到点击处了，
+                    // 那时读到的光标位置才是准的（在 render 里读）。
+                    this.pending_forward = true;
+                    cx.notify();
+                }),
+            )
             .child(Input::new(&self.editor).h_full());
 
         // 布局尺寸一律用 `page_sizes`（按 pt 算出来的），**不用纹理的像素尺寸**。
@@ -1080,6 +1364,10 @@ impl Render for Previewer {
                 (w, h, self.bitmaps[i].clone())
             })
             .collect();
+
+        // 高亮与缩放系数先收成自有数据，免得在子元素闭包里借用 `self`。
+        let base = pixel_per_pt_for_zoom(self.zoom);
+        let flash = self.flash.as_ref().map(|f| (f.page, f.rect, f.seq));
 
         let pages = v_flex()
             .id("pages")
@@ -1116,6 +1404,8 @@ impl Render for Previewer {
                                 .into_any_element(),
                         };
                         div()
+                            // 高亮要绝对定位在页内，所以页框得是定位上下文
+                            .relative()
                             .bg(gpui::white())
                             .shadow_md()
                             .overflow_hidden()
@@ -1126,7 +1416,40 @@ impl Render for Previewer {
                             // **容器永远不会溢出，滚轮因此没有任何东西可滚**，
                             // 而且视口光栅化会误以为「全部页都可见」而把纹理全出出来。
                             .flex_shrink_0()
+                            // 双击这一页 → 光标跳到对应的源码处
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                                    if ev.click_count < 2 {
+                                        return;
+                                    }
+                                    let Some((x, y)) = this.window_to_page_pt(ev.position, i)
+                                    else {
+                                        return;
+                                    };
+                                    this.jump_to_source(i, x, y, window, cx);
+                                }),
+                            )
                             .child(inner)
+                            .children(flash.and_then(|(page, rect, seq)| {
+                                (page == i).then(|| {
+                                    div()
+                                        .absolute()
+                                        .left(px(rect[0] * base))
+                                        .top(px(rect[1] * base))
+                                        .w(px((rect[2] - rect[0]).max(1.0) * base))
+                                        .h(px((rect[3] - rect[1]).max(1.0) * base))
+                                        .bg(theme.primary.opacity(0.28))
+                                        // 一次性反馈，所以淡出。序号当 id：换了序号
+                                        // 才是新元素、才会重新播一遍。
+                                        .with_animation(
+                                            ("jump-flash", seq),
+                                            Animation::new(FLASH),
+                                            |el, delta| el.opacity(1.0 - delta),
+                                        )
+                                        .into_any_element()
+                                })
+                            }))
                     }),
             );
 
@@ -1192,6 +1515,9 @@ impl Render for Previewer {
             .on_action(cx.listener(|this, _: &LastPage, _window, cx| {
                 let last = this.bitmaps.len().saturating_sub(1);
                 this.go_to_page(last, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SyncToPreview, _window, cx| {
+                this.jump_to_preview(cx);
             }))
             .on_action(cx.listener(|this, _: &QuickOpen, window, cx| {
                 this.show_quick_open(window, cx);
@@ -1269,6 +1595,8 @@ fn main() {
             KeyBinding::new("ctrl-b", RecompileNow, None),
             KeyBinding::new("ctrl-shift-f", FormatDocument, None),
             KeyBinding::new("ctrl-e", ExportPdf, None),
+            // 前向跳转的键盘版（双击是鼠标版；“双击选词”不该是唯一入口）
+            KeyBinding::new("ctrl-alt-j", SyncToPreview, None),
             KeyBinding::new("pageup", PrevPage, None),
             KeyBinding::new("pagedown", NextPage, None),
             KeyBinding::new("ctrl-home", FirstPage, None),
