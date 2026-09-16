@@ -14,6 +14,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
@@ -48,6 +49,7 @@ use image_view::ImageView;
 use markdown_view::MarkdownView;
 use markup::Markup;
 use settings::Settings;
+use term_colors::TerminalPalette;
 use themes::ThemeItem;
 
 mod ai;
@@ -58,6 +60,9 @@ mod image_view;
 mod markdown_view;
 mod markup;
 mod settings;
+mod term_colors;
+mod terminal;
+mod terminal_view;
 mod themes;
 mod tree;
 
@@ -86,6 +91,7 @@ actions!(
         AiNextHunk,
         AiPrevHunk,
         AiToggleHunk,
+        ToggleShell,
     ]
 );
 
@@ -434,6 +440,15 @@ struct Previewer {
     ai: AiEdit,
     /// 多轮对话历史（`(是否用户, 文本)`）—— 连续按 Ctrl+K 时模型能记住上文
     ai_history: Vec<(bool, String)>,
+    /// 交互式终端（alacritty + pty）。整个生命周期只在 UI 线程用，
+    /// PTY 的读写线程由 alacritty 的 EventLoop 自己持有。
+    shell_terminal: Option<Rc<terminal::Terminal>>,
+    /// 终端自己的焦点：它得能拿到键盘输入
+    terminal_focus: FocusHandle,
+    /// 终端的输入法状态（中文输入时的预编辑文本）
+    terminal_ime: Entity<terminal_view::ImeState>,
+    /// 终端面板是否可见（Ctrl+4 切换）
+    shell_visible: bool,
     /// 状态栏那个主题下拉框。
     theme_select: Entity<SelectState<Vec<ThemeItem>>>,
     _theme_sub: Subscription,
@@ -519,6 +534,29 @@ impl Previewer {
                 cx.notify();
             },
         );
+
+        // 交互式终端：Windows 上用 PowerShell，其它平台按 $SHELL 找。
+        let terminal_focus = cx.focus_handle();
+        let terminal_ime = cx.new(|_| terminal_view::ImeState { marked_text: None });
+        let shell_terminal = {
+            let shell = default_shell();
+            // `root` 已经被 `EntryState::new` 拿走了，这里重新算一次父目录
+            let start_dir = main_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf();
+            match terminal::Terminal::new(&shell, Some(start_dir), 100, 30) {
+                Ok(term) => {
+                    println!("[typst-live] 终端已启动：{shell}");
+                    Some(Rc::new(term))
+                }
+                Err(err) => {
+                    // 终端起不来不该影响编辑器：记一条，继续跑
+                    println!("[typst-live] 终端启动失败：{err}");
+                    None
+                }
+            }
+        };
 
         // AI 编辑的要求输入框（与快速打开同一个套路：常驻，开关只切可见性）
         let ai_input = cx.new(|cx| {
@@ -619,6 +657,11 @@ impl Previewer {
             _ai_sub: ai_sub,
             ai: AiEdit::default(),
             ai_history: Vec::new(),
+            shell_terminal,
+            terminal_focus,
+            terminal_ime,
+            // 终端默认收起：它是「按需叫出来」的东西，一开窗就占半屏反而吵
+            shell_visible: false,
             theme_name,
             theme_select,
             _theme_sub: theme_sub,
@@ -629,6 +672,11 @@ impl Previewer {
         // 而且 gpui 的动作派发**从聚焦节点开始**，没有焦点时
         // Ctrl+S 之类的全局快捷键根本不会触达 on_action。
         this.editor.update(cx, |state, cx| state.focus(window, cx));
+
+        // 终端事件泵：终端在建世界时就起来了，泵等实体建好再挂
+        if let Some(term) = this.shell_terminal.clone() {
+            this.spawn_terminal_pump(term, cx);
+        }
 
         // **不在这里编译**：45 页冷编译 200+ ms，同步做的话窗口要等它排完
         // 才出现。推迟到第一帧画完（见 `render` 里的 `first_compile`）。
@@ -1100,6 +1148,137 @@ impl Previewer {
         self.recompile(cx);
         self.message = Some(format!("已插入{}", kind.label()));
         cx.notify();
+    }
+
+    // ── 终端 ──────────────────────────────────────────
+
+    /// 终端事件泵：**自适应轮询**。
+    ///
+    /// 有输出时 50ms（回显跟手），连续空闲 2 秒后降到 120ms ——
+    /// `wu` 特意从固定 50ms 改过来的：固定间隔在空闲时也是 20Hz 常量唤醒，
+    /// 白烧 CPU；120ms 上限又保证空闲后第一次敲键的回显延迟肉眼不可感。
+    fn spawn_terminal_pump(&self, term: Rc<terminal::Terminal>, cx: &mut Context<Self>) {
+        let view = cx.entity();
+        cx.spawn(async move |_weak, cx| {
+            let mut idle_rounds: u32 = 0;
+            loop {
+                let interval = if idle_rounds > 40 { 120 } else { 50 };
+                cx.background_executor()
+                    .timer(Duration::from_millis(interval))
+                    .await;
+
+                let events = term.drain_events();
+                if events.is_empty() {
+                    idle_rounds = idle_rounds.saturating_add(1);
+                    continue;
+                }
+                idle_rounds = 0;
+
+                let has_wakeup = events
+                    .iter()
+                    .any(|event| matches!(event, terminal::TermEvent::Wakeup));
+                let exited = events.iter().find_map(|event| match event {
+                    terminal::TermEvent::ChildExit(code) => Some(*code),
+                    _ => None,
+                });
+
+                view.update(cx, |this, cx| {
+                    if let Some(code) = exited {
+                        this.message = Some(format!("终端已退出（退出码 {code:?}）"));
+                    }
+                    if has_wakeup {
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// 终端面板：标题栏 + 终端本体。与 `wu` 同一种摆法。
+    fn render_shell(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+
+        let body: AnyElement = match &self.shell_terminal {
+            Some(term) => {
+                // 终端跟随应用主题的亮/暗（这与「用固定深色终端」是个取舍）：
+                // 浅色主题下若还配深色终端，界面会像贴了块补丁；
+                // 而浅色底必须配 `TerminalPalette::light()` —— ANSI 经典黄/亮黄
+                // 在近白底上对比度不到 1.5:1，基本看不清（`term_colors` 里有说明）。
+                let (fg, bg, palette) = if theme.is_dark() {
+                    (
+                        gpui::white(),
+                        gpui::rgb(0x1e1e1e).into(),
+                        TerminalPalette::dark(),
+                    )
+                } else {
+                    (
+                        gpui::rgb(0x24292e).into(),
+                        gpui::rgb(0xfbfbfb).into(),
+                        TerminalPalette::light(),
+                    )
+                };
+                div()
+                    .flex_1()
+                    .w_full()
+                    .min_h_0()
+                    .child(
+                        terminal_view::TerminalElement::new(
+                            term.clone(),
+                            self.terminal_focus.clone(),
+                            self.terminal_ime.clone(),
+                        )
+                        .colors(fg, bg)
+                        .palette(palette)
+                        .min_contrast(4.5)
+                        .track_focus(&self.terminal_focus),
+                    )
+                    .into_any_element()
+            }
+            None => div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child("终端没起来（启动时失败，看终端日志）")
+                .into_any_element(),
+        };
+
+        v_flex()
+            .w_full()
+            .h(px(260.))
+            .flex_shrink_0()
+            .border_t_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .child(
+                h_flex()
+                    .w_full()
+                    .px_2()
+                    .h(px(24.))
+                    .items_center()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .bg(theme.secondary)
+                    .text_xs()
+                    .child("终端")
+                    .child(
+                        div().ml_auto().child(
+                            Button::new("shell-close")
+                                .ghost()
+                                .label("关闭")
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    this.shell_visible = false;
+                                    cx.notify();
+                                })),
+                        ),
+                    ),
+            )
+            .child(body)
+            .into_any_element()
     }
 
     // ── AI 编辑（Ctrl+K）─────────────────────────────────
@@ -1917,6 +2096,15 @@ impl Previewer {
                             .item(PopupMenuItem::new("目录树").on_click(
                                 window.listener_for(&view, |this, _, _window, cx| {
                                     this.set_sidebar(Sidebar::Tree, cx)
+                                }),
+                            ))
+                            .item(PopupMenuItem::new("终端（Ctrl+4）").on_click(
+                                window.listener_for(&view, |this, _, window, cx| {
+                                    this.shell_visible = !this.shell_visible;
+                                    if this.shell_visible {
+                                        this.terminal_focus.focus(window, cx);
+                                    }
+                                    cx.notify();
                                 }),
                             ))
                             .separator()
@@ -2916,6 +3104,7 @@ impl Render for Previewer {
                     .child(editor_pane)
                     .child(self.render_right_pane(preview_pane, cx)),
             )
+            .children(self.shell_visible.then(|| self.render_shell(cx)))
             // 浮层放在最后，才能盖在内容之上
             .children(self.quick_visible.then(|| self.render_quick_open(cx)))
             .children((self.ai.stage != AiStage::Closed).then(|| self.render_ai(cx)))
@@ -2981,6 +3170,14 @@ impl Render for Previewer {
             .on_action(cx.listener(|this, _: &AiToggleHunk, _window, cx| {
                 this.ai_toggle_hunk(cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleShell, window, cx| {
+                this.shell_visible = !this.shell_visible;
+                // 显示时把焦点交给终端，否则得先点一下才能打字
+                if this.shell_visible {
+                    this.terminal_focus.focus(window, cx);
+                }
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &QuickOpen, window, cx| {
                 this.show_quick_open(window, cx);
             }))
@@ -3014,6 +3211,15 @@ impl Render for Previewer {
                 };
                 this.set_zoom_anchored(next, cx);
             }))
+    }
+}
+
+/// 默认 shell：Windows 上 PowerShell，其它平台看 `$SHELL`。
+fn default_shell() -> String {
+    if cfg!(windows) {
+        "powershell.exe".to_string()
+    } else {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
     }
 }
 
@@ -3099,6 +3305,8 @@ fn main() {
             // AI 编辑。Enter/Tab/空格/Esc 只在浮层内生效（按键上下文限定），
             // 否则会把编辑器自己的按键抢走。
             KeyBinding::new("ctrl-k", AiEditOpen, None),
+            // 终端显隐（与 wu 同一个键位）
+            KeyBinding::new("ctrl-4", ToggleShell, None),
             KeyBinding::new("enter", AiSubmit, Some("AiEdit")),
             KeyBinding::new("tab", AiNextHunk, Some("AiEdit")),
             KeyBinding::new("shift-tab", AiPrevHunk, Some("AiEdit")),

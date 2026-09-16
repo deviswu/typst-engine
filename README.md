@@ -114,6 +114,35 @@ Enter 应用 · Tab/空格 切换本块 · ↑↓ 选块 · Esc 放弃
 curl 的退出码翻译成人话再报（7 = 连不上端点 / 28 = 超时 / 35 = TLS / 60 = 证书），
 直接报「退出码 7」等于没说。
 
+### 交互式终端（Ctrl+4）
+
+底部面板，`Ctrl+4` 显隐（与 `wu` 同键位），标题栏带关闭按钮。跑的是真终端：
+`alacritty_terminal`（Zed 同款终端核心，自带 pty）+ Windows 上的 PowerShell。
+
+两处值得记的实现：
+
+- **事件泵是自适应轮询**：有输出时 50 ms（回显跟手），连续空闲 2 秒后降到 120 ms。
+  固定 50 ms 在空闲时是 20 Hz 常量唤醒，白烧 CPU；120 ms 上限又保证空闲后第一次
+  敲键的回显延迟肉眼不可感 —— 这套是 `wu` 调出来的，照搬
+- **调色板跟随应用主题**：浅色主题配 `TerminalPalette::light()`。ANSI 经典 X11 固定色
+  （黄 `#CDCD00`）在近白底上对比度不到 1.5:1，基本看不清；程序若用真彩色直接指定
+  颜色（纯黄 `#FFFF00`），`ensure_contrast` 会只调亮度、保住色相与饱和度
+
+这个模块（`terminal.rs` + `terminal_view.rs` + `term_colors.rs`）是**整段搬 `wu` 的**：
+同一套 gpui rev，所以 `cp` + 让编译器报错比「照着重写」快也更不容易走样。
+`term_colors.rs` 是从 `wu` 的 `theme.rs` 里按函数边界摘出来的（那边 800 行是整套主题
+系统，这里只要终端那一小块）。
+
+验证（真窗口，自检向 pty 写命令再从网格读回）：
+
+```
+[typst-live] 终端已启动：powershell.exe
+[selftest] @89ms   已向 pty 写入 echo 命令
+[selftest] @2021ms 网格 14 行，读到命令回显？true
+[selftest]   网格行："Windows PowerShell"
+[selftest]   网格行："PS D:\...\fixtures> echo TERM_OK_MARK"
+```
+
 ### 设置存在哪
 
 `%APPDATA%\typst-live\settings.conf`（类 Unix 是 `$HOME/.config/typst-live/`）。

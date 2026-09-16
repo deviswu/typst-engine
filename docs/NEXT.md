@@ -33,7 +33,7 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 | L9 | 长文档首屏（首次排版推迟到开窗之后） | ✅ 窗口先出来，预览区显示「首次排版中…」 |
 | L10 | 界面向 `wu` 对齐：菜单条 · 目录树 · 右侧多视图（预览/Markdown/图片） | ✅ `crates/app/src/{tree,image_view,markdown_view}.rs` |
 | L11 | AI 编辑（选中文字 → Ctrl+K → 逐块 diff → 应用） | ✅ `crates/app/src/{ai,diff}.rs` + 浮层接线 |
-| L12 | 终端（alacritty_terminal） | 🚧 待做：模块要自己移（子代理那条路在本机不通） |
+| L12 | 交互式终端（alacritty_terminal + PowerShell，Ctrl+4） | ✅ `crates/app/src/{terminal,terminal_view,term_colors}.rs` |
 
 - 28 个 commit，8000 行 Rust（36 个 `.rs` 文件），clippy 与 `cargo fmt` 都干净
 - 远端：`github.com/deviswu/typst-engine`（public，`master`，SSH）—— `git push` 即可
@@ -57,14 +57,11 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 
 ## 下一步（按我的推荐排序）
 
-0. **终端**（L12）：`wu/src/terminal.rs` + `terminal_view.rs`（1260 行）要自己移过来。
-   接线模式已经摸清：`Terminal::new(&shell, Some(dir), 100, 30)`、
-   自适应轮询事件泵（有输出 50ms / 空闲降到 120ms）、
-   `TerminalElement::new(term, focus, ime).colors(..).palette(..).track_focus(..)`、
-   `ToggleShell` 绑 `ctrl-4` + `.visible(shell_visible)`。
-   注意：**子代理那条路在本机不通**（claude_code 未安装；pi/codex 那条虽然能跑但没产出文件），
-   别再把大块移植外包出去。
-1. **首次排版的过程感** —— 现在只是「推迟 + 一行提示」。177 页要 854 ms，
+0. **终端还没验的部分**：键盘输入 → pty（`TerminalElement` 里那套按键编码是照搬
+   `wu` 的）、鼠标选中复制、面板高度可拖。自检只验到了「pty 通、网格能读回、
+   面板能画」；剩下的得人点。
+1. **首次排版的过程感**
+1. **首次排版的过程感**（承接上一条）—— 现在只是「推迟 + 一行提示」。177 页要 854 ms，
    可以先把第一页排出来先显示（需要把 `typst::compile` 换成按页/分段的办法，
    或者给首屏用 syntax-only 骨架）—— **先写能复现慢编译的测试再动**。
 2. **下载包时的进度** —— `typst-kit` 有 `ProgressDownloader`（带回调）。
@@ -116,7 +113,16 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 | **点了「拒绝」，文件还是被改了** | 重建时无条件补了个结尾换行 | 结尾换行也跟原文一致；「全拒绝」必须逐字节等于原文（有测试） |
 | AI 请求把界面卡住（设置防抖/终端轮询一起停摆） | 阻塞调用丢进 gpui 的 background_executor 池 | 放 `std::thread`，界面只按 100ms 轮询回执 |
 | 报「curl 退出码 7」看不出该怎么办 | 没翻成人话 | 7→连不上端点、28→超时、35→TLS、60→证书 |
+| 浅色主题下终端里的黄字几乎看不见 | ANSI 经典固定色是为深色底挑的 | 跟随主题换调色板 + `ensure_contrast` 只调亮度 |
+| `Button.xsmall()` 编译不过 | 这个 gpui-component rev 的 Sizable 走 `with_size(Size::Small)` | 用 `with_size` |
+| 构造里 `root` 被 `EntryState::new` 移走后再用 | `PathBuf` 不是 Copy | 重新从 `main_path.parent()` 算一次 |
 | 右键示例文档报波浪线 | 我写成了 Markdown 的 `**粗体**`，Typst 是 `*...*` | — |
+
+**移植大模块的省力办法**（这次终端的 1260 行就是这么搬的）：同一套
+gpui / gpui-component rev 下，别读代码再重写 —— `cp` 过来、加 `mod` 声明、
+让 `cargo check` 报错，按错误逐个补（这次只差一个 `crate::theme`，把它需要的
+几个函数按**括号配平**从对方文件里摘出来成单独模块就完事了）。
+只有「本项目没有对应模块」的地方（如 `crate::log`）才需要真改。
 
 **通用教训**：多窗口桌面上截图对比不可靠（会被别的窗口挡住/干扰），
 **程序自报的数字才可信**。上面前三条都是靠加日志/让程序报数才定位的。
