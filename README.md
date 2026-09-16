@@ -8,6 +8,20 @@ Typst 的**实时增量编译引擎** —— 一个 UI 无关的 Rust 库。
 - **不依赖 tree-sitter** —— 语法树直接来自官方 `typst-syntax`
 - **支持未保存内容** —— 通过覆盖式虚拟文件系统，编译器看到的就是你正在敲的文本
 
+## 跑起来看
+
+```bash
+cargo run -p typst-live                # 开窗，用内置示例文档
+cargo run -p typst-live -- doc.typ     # 开窗，打开指定文件
+```
+
+左边是带 Typst 语法高亮的编辑器，右边跟着实时更新。状态栏那四个数字就是
+「实时」的证据：编译耗时 / 重解析字节 / 页数 / 第几次编译。
+
+```bash
+cargo run --example realtime   # 不开窗，在终端里跑逐字输入的性能数据
+```
+
 ## 实测
 
 300 段中文文档（34 KB / 9 页 A4），逐字输入：
@@ -20,12 +34,6 @@ Typst 的**实时增量编译引擎** —— 一个 UI 无关的 Rust 库。
 30 次敲键累计 55.9 ms，而全量重编需要 5732.4 ms
 ```
 
-自己跑一遍：
-
-```bash
-cargo run --example realtime
-```
-
 ## 当前进度
 
 | 层 | 内容 | 状态 |
@@ -33,16 +41,17 @@ cargo run --example realtime
 | L0 | 覆盖式 VFS（内存盖住磁盘 + revision 语义） | ✅ 完成 |
 | L1 | 增量 World（`SourceDb` / 字体 / 包 / `impl typst::World`） | ✅ 完成 |
 | L2 | 编译驱动（防抖 / 队列 / `success_doc` 不白屏） | ⏳ Plan 2 |
-| L3 | 导出计算图（SVG / 位图 / PDF / 页级增量） | ⏳ Plan 2 |
-| L4 | 语法服务（高亮 / 大纲 / 折叠） | ⏳ Plan 3 |
-| L5 | GPUI 外壳 | 不进本仓库 |
+| L3 | 导出：SVG 页已通；计算图 / 位图 / PDF / 页级增量 | 🟡 部分 |
+| L4 | 语法服务（高亮 / 大纲 / 折叠） | ⏳ Plan 3（编辑器高亮目前走 tree-sitter） |
+| L5 | GPUI 外壳 | ✅ `crates/app`（`typst-live`） |
 
-测试：**68 个全绿**（62 单测 + 6 集成），clippy 零警告。
+测试：**71 个全绿**（65 单测 + 6 集成），clippy 零警告。
 
 ```bash
 cargo test                    # 全部
 cargo clippy --all-targets    # 应该是干净的
-cargo run --example realtime  # 看实时编译数据
+cargo run --example realtime  # 终端的逐字输入性能数据
+cargo run -p typst-live       # 开窗的实时预览器
 ```
 
 ## 目录
@@ -51,16 +60,16 @@ cargo run --example realtime  # 看实时编译数据
 typst-engine/                      Cargo workspace
 ├── crates/engine/src/
 │   ├── path_util.rs               就地消掉 `.` / `..`
+│   ├── export/svg.rs              页面 → SVG（矢量预览）
 │   ├── vfs/                       L0：访问抽象 / 内存 / 磁盘 / 覆盖层 / Vfs+revision
 │   └── world/                     L1：QueryRef / SourceDb / EntryState / 字体 / 包 / EngineWorld
 │       ├── source_db.rs           ★ 靠 Source::replace 做增量重解析
 │       └── engine.rs              impl typst::World
-├── crates/engine/examples/realtime.rs   可运行的实时编译演示
+├── crates/app/src/main.rs         L5：GPUI 外壳（typst-live）
+├── crates/engine/examples/realtime.rs   终端里的性能演示
 ├── crates/engine/tests/           集成测试 + fixtures
 └── docs/superpowers/              设计文档与实施计划
 ```
-
-（GPUI 外壳不在本仓库 —— 引擎先独立跑通并达标，再接 UI。）
 
 ## 文档
 
