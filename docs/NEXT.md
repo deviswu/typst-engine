@@ -118,6 +118,17 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 | 构造里 `root` 被 `EntryState::new` 移走后再用 | `PathBuf` 不是 Copy | 重新从 `main_path.parent()` 算一次 |
 | 右键示例文档报波浪线 | 我写成了 Markdown 的 `**粗体**`，Typst 是 `*...*` | — |
 
+**子代理（AgentShell）在这台机器上能不能用**（2026-09-16 实测，别再重复试）：
+
+| agent_type | 结果 |
+|---|---|
+| `claude_code` | ✗ `[WinError 2]` —— 没装这个 CLI |
+| `pi` | ✗ 同一个错（虽然 `pi` 在 PATH 里，AgentShell 仍拉不起来） |
+| `codex` | **装是装了**，但 Windows 下非 ASCII 参数传不进去：`invalid UTF-8 was detected in one or more arguments` |
+
+结论：**派活时 prompt 必须写成纯 ASCII**（codex 那条就能用），或者干脆自己干。
+本次终端（1260 行）与 AI 模块（原计划外包）最后都是自己做的。
+
 **移植大模块的省力办法**（这次终端的 1260 行就是这么搬的）：同一套
 gpui / gpui-component rev 下，别读代码再重写 —— `cp` 过来、加 `mod` 声明、
 让 `cargo check` 报错，按错误逐个补（这次只差一个 `crate::theme`，把它需要的
