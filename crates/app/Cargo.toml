@@ -22,3 +22,8 @@ typst-layout = { workspace = true }
 
 # 编辑器里的 Typst 语法高亮（gpui-component 自带的语言集里没有 typst）
 codebook-tree-sitter-typst = "0.12.1"
+
+# 必须与 gpui 的 image 版本**严格一致**：`RenderImage::new` 收的是
+# `image::Frame`，版本不同就是两个不同类型，编译不过。
+# 版本号取自 zed workspace 根 Cargo.toml（image = "0.25.1"）。
+image = { version = "0.25.1", default-features = false }

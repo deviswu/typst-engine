@@ -8,11 +8,9 @@
 //! cargo run -p typst-live -- doc.typ   # 打开指定文件
 //! ```
 //!
-//! 状态栏上那四个数字就是「实时」的证据：
-//! - 编译耗时（引擎真正花在排版上的时间）
-//! - 重解析字节 / 全文字节（增量到底省了多少）
-//! - 页数
-//! - 第几次编译（敲一次键加一）
+//! **排版与光栅化是两层**：缩放只重做光栅化，不重新排版。状态栏上
+//! 「排版 N 次 / 光栅化 M 次」两个计数会把这件事直接显示出来 ——
+//! 按 Ctrl+= 缩放时你只会看到后一个数在涨。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,11 +22,15 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{ActiveTheme as _, Root, h_flex, v_flex};
 
 use typst::foundations::Bytes;
+use typst_engine::export::{RasterPage, pixel_per_pt_for_zoom, rasterize};
 use typst_engine::world::{EngineWorld, EntryState, embedded_and_system_fonts};
 use typst_layout::PagedDocument;
 
-/// 预览里一页的显示宽度（点）。SVG 是矢量的，缩放不会糊。
-const PAGE_WIDTH: f32 = 640.0;
+actions!(typst_live, [ZoomIn, ZoomOut, ZoomReset]);
+
+const ZOOM_MIN: f32 = 0.25;
+const ZOOM_MAX: f32 = 4.0;
+const ZOOM_STEP: f32 = 1.25;
 
 const DEMO_DOC: &str = r#"#set page(width: 15cm, height: auto, margin: 1.8cm)
 #set text(size: 11pt)
@@ -39,13 +41,18 @@ const DEMO_DOC: &str = r#"#set page(width: 15cm, height: auto, margin: 1.8cm)
 
 没有子进程，没有存盘，没有 IPC —— 编译器直接读内存里未保存的文本。
 
+== 试试缩放
+
+按 *Ctrl+=* 放大、*Ctrl+-* 缩小、*Ctrl+0* 回到 100%。
+
+看状态栏：**排版次数不会变，光栅化次数才会变** —— 因为缩放只是重新出图，
+没有重新排版。DPI 完全由我们自己决定，所以放到 400% 也不会糊。
+
 == 为什么能这么快
 
 + 覆盖式虚拟文件系统：编译器看到的就是你正在敲的内容
 + `Source::replace` 的增量重解析：敲一个字只重解析几十字节
 + comemo 记忆化排版：没变的部分不重算
-
-看状态栏：*编译耗时* 与 *重解析字节*。
 
 == 数学与表格
 
@@ -83,11 +90,17 @@ fn register_typst_language() {
 
 #[derive(Default)]
 struct Status {
+    /// 排版耗时（`typst::compile`）。
     compile_ms: f64,
+    /// 光栅化耗时（`typst_engine::export::rasterize`）。
+    raster_ms: f64,
     reparsed: usize,
     text_bytes: usize,
     pages: usize,
+    /// 排版次数。缩放**不会**让它增加。
     compiles: usize,
+    /// 光栅化次数。缩放**会**让它增加。
+    rasters: usize,
     errors: Vec<String>,
 }
 
@@ -95,12 +108,12 @@ struct Previewer {
     engine: EngineWorld,
     main_path: PathBuf,
     editor: Entity<InputState>,
-    /// 最近一次成功编译的页面（SVG 源码）。
-    svg_pages: Vec<String>,
-    /// 转成 GPUI 能画的位图缓存。
+    /// 排版结果。缩放时原样不动 —— 这是「排版 / 光栅化」两层的分界。
+    doc: Option<Arc<PagedDocument>>,
+    /// 缩放倍率。1.0 = 屏幕上「实际大小」（96 dpi）。
+    zoom: f32,
+    /// 光栅化产物（GPU 纹理）。每次排版或缩放后重建。
     bitmaps: Vec<Arc<RenderImage>>,
-    /// 是否已经把「解码完成」播报过一次（只用于控制台日志）。
-    rasterize_reported: bool,
     status: Status,
     _sub: Subscription,
 }
@@ -146,9 +159,9 @@ impl Previewer {
             engine,
             main_path,
             editor,
-            svg_pages: Vec::new(),
+            doc: None,
+            zoom: 1.0,
             bitmaps: Vec::new(),
-            rasterize_reported: false,
             status: Status::default(),
             _sub: sub,
         };
@@ -156,8 +169,9 @@ impl Previewer {
         this
     }
 
-    /// 一次完整的「编辑 → 重排版」循环。同步执行 —— 因为它只有几毫秒，
-    /// 开线程反而会引入调度开销和状态同步麻烦。
+    /// 一次完整的「编辑 → 重排版 → 重新出图」循环。
+    ///
+    /// 同步执行：排版只要几毫秒，开线程反而引入调度开销与状态同步的麻烦。
     fn recompile(&mut self, cx: &mut Context<Self>) {
         let text = self.editor.read(cx).value().to_string();
         let main_id = self.engine.entry().main();
@@ -172,21 +186,21 @@ impl Previewer {
         // ③ 排版
         let t = Instant::now();
         let result = typst::compile::<PagedDocument>(&self.engine);
-        let elapsed = t.elapsed();
+        self.status.compile_ms = t.elapsed().as_secs_f64() * 1000.0;
+        self.status.compiles += 1;
 
-        self.status.compile_ms = elapsed.as_secs_f64() * 1000.0;
         self.status.reparsed = outcome.reparsed.map(|r| r.len()).unwrap_or(0);
         self.status.text_bytes = text.len();
-        self.status.compiles += 1;
 
         match result.output {
             Ok(doc) => {
+                let doc = Arc::new(doc);
                 self.status.pages = doc.pages().len();
-                self.svg_pages = typst_engine::export::page_svgs(&doc);
+                self.doc = Some(doc);
                 self.status.errors.clear();
             }
             Err(errors) => {
-                // 编译失败：**不动 svg_pages**，右边继续显示上一次成功的结果。
+                // 编译失败：**不动 doc**，右边继续显示上一次成功的结果。
                 self.status.errors = errors
                     .iter()
                     .take(6)
@@ -195,6 +209,44 @@ impl Previewer {
             }
         }
 
+        self.rerasterize();
+        cx.notify();
+    }
+
+    /// 从已排版的 `doc` 重新出图。**不碰编译器**。
+    fn rerasterize(&mut self) {
+        let Some(doc) = self.doc.clone() else {
+            self.bitmaps.clear();
+            return;
+        };
+
+        let ppp = pixel_per_pt_for_zoom(self.zoom);
+        let t = Instant::now();
+        let pages = rasterize(&doc, ppp);
+        self.status.raster_ms = t.elapsed().as_secs_f64() * 1000.0;
+        self.status.rasters += 1;
+
+        let total: usize = pages.iter().map(|p| p.rgba.len()).sum();
+        self.bitmaps = pages.into_iter().filter_map(to_texture).collect();
+
+        println!(
+            "[typst-live] 光栅化 {} 页 @ {:.0}% ({:.2} px/pt)：{:.1} ms，纹理共 {:.1} MiB",
+            self.bitmaps.len(),
+            self.zoom * 100.0,
+            ppp,
+            self.status.raster_ms,
+            total as f64 / (1024.0 * 1024.0),
+        );
+    }
+
+    fn set_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
+        let zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        if (zoom - self.zoom).abs() < f32::EPSILON {
+            return;
+        }
+        self.zoom = zoom;
+        // 只重做出图，不重新排版 —— 这就是缩放能任意清晰的原因。
+        self.rerasterize();
         cx.notify();
     }
 
@@ -205,21 +257,30 @@ impl Previewer {
             .w_full()
             .px_3()
             .py_1p5()
-            .gap_5()
+            .gap_4()
             .border_b_1()
             .border_color(theme.border)
             .text_sm()
             .child(
                 div()
                     .text_color(theme.primary)
-                    .child(format!("⏱ {:.1} ms", self.status.compile_ms)),
+                    .child(format!("排版 {:.1} ms", self.status.compile_ms)),
             )
+            .child(format!("光栅化 {:.1} ms", self.status.raster_ms))
             .child(format!(
-                "重解析 {} B / 全文 {} B",
+                "重解析 {} B / {} B",
                 self.status.reparsed, self.status.text_bytes
             ))
             .child(format!("{} 页", self.status.pages))
-            .child(format!("第 {} 次编译", self.status.compiles));
+            .child(
+                div()
+                    .text_color(theme.primary)
+                    .child(format!("缩放 {:.0}%", self.zoom * 100.0)),
+            )
+            .child(format!(
+                "排版 {} 次 / 光栅化 {} 次",
+                self.status.compiles, self.status.rasters
+            ));
 
         if self.status.errors.is_empty() {
             bar = bar.child(div().text_color(theme.success).child("✓ 无错误"));
@@ -248,47 +309,29 @@ impl Previewer {
     }
 }
 
+/// 引擎的 `RasterPage` → GPUI 的 GPU 纹理。
+///
+/// 这里**同步**构造 `RenderImage`，刻意不走 `Image::from_bytes` 那条路 ——
+/// 后者要过 asset 系统做异步解码（`use_asset`），第一次必然拿不到结果。
+/// 而且 `Image::from_bytes` 的缓存键是内容哈希，同一份内容永远复用同一张
+/// 纹理，缩放就拿不到更高分辨率。自己构造就没有这两个问题。
+fn to_texture(page: RasterPage) -> Option<Arc<RenderImage>> {
+    let (width, height) = (page.width, page.height);
+    let mut rgba = page.rgba;
+
+    // tiny-skia 给的是 RGBA（alpha 已预乘），GPU 纹理要 BGRA。
+    for pixel in rgba.as_chunks_mut::<4>().0 {
+        swap_rgba_pa_to_bgra(pixel);
+    }
+
+    let buffer: image::ImageBuffer<image::Rgba<u8>, Vec<u8>> =
+        image::ImageBuffer::from_raw(width, height, rgba)?;
+
+    Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
+}
+
 impl Render for Previewer {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // gpui 的图片解码是**异步**的（`ImageSource::Image` 走 `use_asset`）：
-        // 第一次问必然拿不到，解码完成后 gpui 会自己 notify 让我们重画。
-        // 所以这里每帧都问一遗，而不是「问一次没拿到就永久放弃」。
-        // `Image::from_bytes` 的 id 是内容哈希，同一份 SVG 反复问不会重复解码。
-        let decoded: Vec<Arc<RenderImage>> = self
-            .svg_pages
-            .iter()
-            .filter_map(|svg| {
-                let image = Image::from_bytes(ImageFormat::Svg, svg.clone().into_bytes());
-                Arc::new(image).use_render_image(window, cx)
-            })
-            .collect();
-
-        if decoded.len() == self.svg_pages.len() {
-            if !decoded.is_empty() && !self.rasterize_reported {
-                // 把实际光栅化出来的纹理尺寸也报出来 —— 它决定了缩放上限与显存占用。
-                let svg_lens: Vec<usize> = self.svg_pages.iter().map(|s| s.len()).collect();
-                eprintln!(
-                    "[typst-live] SVG → 纹理：{} 页；SVG 总共 {} KiB（最大一页 {} KiB）",
-                    decoded.len(),
-                    svg_lens.iter().sum::<usize>() / 1024,
-                    svg_lens.iter().max().copied().unwrap_or(0) / 1024,
-                );
-                for (i, img) in decoded.iter().enumerate() {
-                    let px = img.size(0);
-                    let bytes = img.as_bytes(0).map(|b| b.len()).unwrap_or(0);
-                    eprintln!(
-                        "[typst-live]   第 {} 页纹理：{}×{} 像素，BGRA {} KiB",
-                        i + 1,
-                        px.width.0,
-                        px.height.0,
-                        bytes / 1024,
-                    );
-                }
-                self.rasterize_reported = true;
-            }
-            self.bitmaps = decoded;
-        }
-
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let has_errors = !self.status.errors.is_empty();
 
@@ -300,21 +343,23 @@ impl Render for Previewer {
             .border_color(theme.border)
             .child(Input::new(&self.editor).h_full());
 
+        // 纹理已是最终分辨率，按 1:1 显示即可 —— 缩放倍率已经体现在像素数里。
         let pages = v_flex()
             .id("pages")
             .flex_1()
             .h_full()
-            .overflow_y_scroll()
+            .overflow_scroll()
             .bg(theme.secondary)
             .gap_5()
             .py_5()
             .items_center()
             .children(self.bitmaps.iter().map(|bitmap| {
-                div()
-                    .bg(gpui::white())
-                    .rounded_sm()
-                    .overflow_hidden()
-                    .child(img(ImageSource::Render(bitmap.clone())).w(px(PAGE_WIDTH)))
+                let size = bitmap.size(0);
+                div().bg(gpui::white()).shadow_md().overflow_hidden().child(
+                    img(ImageSource::Render(bitmap.clone()))
+                        .w(px(size.width.0 as f32))
+                        .h(px(size.height.0 as f32)),
+                )
             }));
 
         let preview_pane = if has_errors {
@@ -340,6 +385,17 @@ impl Render for Previewer {
                     .child(editor_pane)
                     .child(preview_pane),
             )
+            .on_action(cx.listener(|this, _: &ZoomIn, _window, cx| {
+                let next = this.zoom * ZOOM_STEP;
+                this.set_zoom(next, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ZoomOut, _window, cx| {
+                let next = this.zoom / ZOOM_STEP;
+                this.set_zoom(next, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ZoomReset, _window, cx| {
+                this.set_zoom(1.0, cx);
+            }))
     }
 }
 
@@ -373,6 +429,12 @@ fn main() {
         // 用 gpui-component 的任何东西之前必须先 init。
         gpui_component::init(cx);
         register_typst_language();
+
+        cx.bind_keys([
+            KeyBinding::new("ctrl-=", ZoomIn, None),
+            KeyBinding::new("ctrl--", ZoomOut, None),
+            KeyBinding::new("ctrl-0", ZoomReset, None),
+        ]);
 
         let (source, path) = load_document(path_arg);
 

@@ -14,6 +14,7 @@ typst = "0.15.1"
 typst-syntax = "0.15.1"
 typst-layout = "0.15.1"
 typst-svg = "0.15.1"
+typst-render = "0.15.1"
 typst-kit = { version = "0.15.1", features = [
     "scan-fonts",     # 扫系统字体
     "embedded-fonts", # typst 自带的内嵌字体（不含它，缺字体就编译不出东西）
