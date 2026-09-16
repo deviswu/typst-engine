@@ -133,6 +133,9 @@ fn since_start_ms() -> f64 {
 /// 上面留一点，好看见「这是哪一段」。
 const SYNC_MARGIN: f32 = 80.0;
 
+/// 标签栏高度。展示区的头与它**等高**，这样两边白色顶边对齐。
+const TAB_BAR_HEIGHT: f32 = 30.0;
+
 /// 预览里页面两侧留的边距（逻辑像素）。「适应宽度」时页宽 = 展示区宽 - 2×它。
 const PREVIEW_MARGIN: f32 = 24.0;
 
@@ -2168,7 +2171,7 @@ impl Previewer {
             .id("tab-bar")
             .w_full()
             .flex_shrink_0()
-            .h(px(30.))
+            .h(px(TAB_BAR_HEIGHT))
             .gap_1()
             .px_2()
             .items_center()
@@ -2653,18 +2656,23 @@ impl Previewer {
             .flex_1()
             .h_full()
             .min_w_0()
-            .children(title.map(|title| {
+            // 展示区**总有一条头**，高度与编辑区的标签栏一致（30px）——
+            // 这样两边的白色区域从**同一条线**开始（顶部对齐）。
+            // 预览模式下头里写「排版预览」，其余模式写正在看的文件。
+            .child(
                 h_flex()
                     .w_full()
                     .flex_shrink_0()
-                    .px_3()
-                    .py_1()
+                    .h(px(TAB_BAR_HEIGHT))
+                    .px_2()
+                    .items_center()
                     .border_b_1()
                     .border_color(theme.border)
+                    .bg(theme.secondary)
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(title)
-            }))
+                    .child(title.unwrap_or_else(|| "排版预览".to_string())),
+            )
             .child(body)
     }
 
@@ -3421,7 +3429,7 @@ impl Render for Previewer {
             .track_scroll(&self.scroll)
             .bg(theme.secondary)
             .gap_5()
-            .py_5()
+            .pb_5()
             .items_center()
             .children(
                 page_rows
