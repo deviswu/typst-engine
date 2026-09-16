@@ -119,6 +119,8 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 | 构造里 `root` 被 `EntryState::new` 移走后再用 | `PathBuf` 不是 Copy | 重新从 `main_path.parent()` 算一次 |
 | 两个按钮用同一个 `ElementId` 会撞 | 工具栏的「图片」与右侧页签的「图片」同名 | 工具栏 id 加前缀 `tb:` |
 | 编到一半报「拒绝访问 typst-live.exe」 | 上一次 `cargo run` 的窗口还开着，文件被占 | `taskkill /F /IM typst-live.exe` 再编 |
+| **按钮文字溢到邻居身上（看着像重叠）** | flex 行默认 `flex-shrink: 1`，容器一窄就把子项压得比文字还窄 | 每个按钮/指标加 `flex_shrink_0`（与页框那次同一个坑，这次是**全应用**补） |
+| 工具栏挤成一团、还盖到预览上 | 工具栏挂在 520px 宽的编辑区列里，26 个按钮必然溢出 | 工具栏提到外层 v_flex，**全宽一条** |
 | 右键示例文档报波浪线 | 我写成了 Markdown 的 `**粗体**`，Typst 是 `*...*` | — |
 
 **子代理（AgentShell）在这台机器上能不能用**（2026-09-16 实测，别再重复试）：
@@ -156,3 +158,12 @@ gpui / gpui-component rev 下，别读代码再重写 —— `cp` 过来、加 `
   “内容坐标 / 窗口坐标” 的 bug；把同一个函数算两遍是抓不到错的。
 - 读剪贴板式的窗口截图：先 `SetProcessDpiAwarenessContext(-4)` 再
   `CopyFromScreen`，否则拿到的是被系统缩过的逻辑分辨率，看不出清晰度差异。
+- **想给这个应用的窗口拍照，别指望自动化**（2026-09-16 实测）：
+  - 全屏 `CopyFromScreen` 会拍到**盖在上面的别的窗口**（那次拍到的是浏览器）
+  - `SetForegroundWindow` 对后台进程**被系统挡掉**，提不到前台
+  - `PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT)` 对 gpui 这种 GPU 合成窗口
+    **只能拿到空图**（PNG 10KB）
+  - PowerShell 脚本要**纯 ASCII**：本机 PowerShell 按 ANSI 读脚本，中文串会把
+    语法打断（`字符串缺少终止符`）
+  - 结论：UI 观感类改动只能**请人看一眼**；能自动化的部分改成「核对结构 + 让程序
+    报数字」（例如断言工具栏是顶层子项、按钮数、flex_shrink_0 的处数）

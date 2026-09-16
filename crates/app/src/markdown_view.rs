@@ -39,6 +39,11 @@ impl MarkdownView {
     pub fn is_empty(&self) -> bool {
         self.source.trim().is_empty()
     }
+
+    /// 当前显示的是哪个文件（右栏标题用）。
+    pub fn path(&self) -> Option<&str> {
+        self.path.as_deref()
+    }
 }
 
 impl Render for MarkdownView {

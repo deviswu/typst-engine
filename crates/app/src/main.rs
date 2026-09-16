@@ -31,8 +31,8 @@ use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::select::{Select, SelectEvent, SelectState};
 use gpui_component::tree::{Tree, TreeEvent, TreeState};
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, IndexPath, Root, RopeExt as _, Selectable as _, h_flex,
-    v_flex,
+    ActiveTheme as _, Icon, IconName, IndexPath, Root, RopeExt as _, Selectable as _, Sizable as _,
+    h_flex, v_flex,
 };
 
 use typst::diag::SourceDiagnostic;
@@ -2037,6 +2037,7 @@ impl Previewer {
         let file_menu = {
             let view = view.clone();
             Button::new("menu-file")
+                .flex_shrink_0()
                 .ghost()
                 .compact()
                 .label("文件")
@@ -2146,6 +2147,7 @@ impl Previewer {
         let ai_menu = {
             let view = view.clone();
             Button::new("menu-ai")
+                .flex_shrink_0()
                 .ghost()
                 .compact()
                 .label("AI")
@@ -2200,6 +2202,7 @@ impl Previewer {
 
         let tab = |label: &'static str, mode: Sidebar, cx: &Context<Self>| {
             Button::new(label)
+                .flex_shrink_0()
                 .ghost()
                 .compact()
                 .label(label)
@@ -2305,32 +2308,36 @@ impl Previewer {
         .into_any_element()
     }
 
-    /// 右侧主区：预览 / Markdown / 图片（顶部页签切换）。
+    /// 右侧主区：**按内容自动选视图**，没有切换按钮。
+    ///
+    /// 与 `wu` 一致：打开 `.typ` 就看排版预览、打开 `.md` 就看 Markdown、
+    /// 打开图片就看图片 —— 视图由「现在在看什么文件」决定，不由用户点页签决定。
+    /// 所以这里只按 `self.right`（由 `open_path` / `open_in_editor` 设置）画内容，
+    /// 页面顶部给一行**纯文本**标题（说明正在看什么），不放按钮。
     fn render_right_pane(&self, preview: AnyElement, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
 
-        let tab = |label: &'static str, mode: RightPane, cx: &Context<Self>| {
-            Button::new(label)
-                .ghost()
-                .compact()
-                .label(label)
-                .selected(self.right == mode)
-                .on_click(cx.listener(move |this, _, _window, cx| this.set_right(mode, cx)))
+        // 标题：预览模式不写（状态栏已经有页码了），非预览模式写清在放什么
+        let title: Option<String> = match self.right {
+            RightPane::Preview => None,
+            RightPane::Markdown => self
+                .markdown
+                .read(cx)
+                .path()
+                .map(|path| format!("Markdown · {}", short_path(path))),
+            RightPane::Image => self.image.as_ref().map(|view| {
+                format!(
+                    "图片 · {}",
+                    short_path(&view.read(cx).path().to_string_lossy())
+                )
+            }),
         };
 
         let body: AnyElement = match self.right {
             RightPane::Preview => preview,
             RightPane::Markdown => {
                 if self.markdown.read(cx).is_empty() {
-                    div()
-                        .size_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child("在左边目录树里点一个 .md 文件")
-                        .into_any_element()
+                    placeholder("在左边目录树里点一个 .md 文件", theme)
                 } else {
                     div()
                         .size_full()
@@ -2340,15 +2347,10 @@ impl Previewer {
             }
             RightPane::Image => match &self.image {
                 Some(view) => div().size_full().child(view.clone()).into_any_element(),
-                None => div()
-                    .size_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child("在左边目录树里点一张图片（png/jpg/webp/gif/bmp/svg）")
-                    .into_any_element(),
+                None => placeholder(
+                    "在左边目录树里点一张图片（png/jpg/webp/gif/bmp/svg）",
+                    theme,
+                ),
             },
         };
 
@@ -2356,20 +2358,19 @@ impl Previewer {
             .flex_1()
             .h_full()
             .min_w_0()
-            .child(
+            .children(title.map(|title| {
                 h_flex()
                     .w_full()
                     .flex_shrink_0()
-                    .px_2()
+                    .px_3()
                     .py_1()
-                    .gap_1()
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(tab("排版预览", RightPane::Preview, cx))
-                    .child(tab("Markdown", RightPane::Markdown, cx))
-                    .child(tab("图片", RightPane::Image, cx)),
-            )
-            .child(div().flex_1().min_h_0().w_full().child(body))
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(title)
+            }))
+            .child(body)
     }
 
     /// AI 编辑浮层：输入要求 → 生成中 → 逐块确认。
@@ -2552,15 +2553,22 @@ impl Previewer {
     fn render_statusbar(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
 
+        // 每个指标都 `flex_shrink_0`：状态栏一窄就会把文字压到互相重叠
+        // （与「页框被 flex 压扁」是同一个坑），要裁就整体裁掉右边几个。
         let mut metrics = h_flex()
             .gap_3()
             .text_xs()
             .child(
                 div()
+                    .flex_shrink_0()
                     .text_color(theme.primary)
                     .child(format!("排版 {:.1}ms", self.status.compile_ms)),
             )
-            .child(format!("光栅化 {:.1}ms", self.status.raster_ms));
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .child(format!("光栅化 {:.1}ms", self.status.raster_ms)),
+            );
 
         if self.index_builds > 0 {
             metrics = metrics.child(format!("索引 {:.1}ms", self.index_ms));
@@ -2928,19 +2936,21 @@ impl Render for Previewer {
         let sidebar_pane = self.render_sidebar(cx);
 
         // 工具栏：一键插入，分组画分隔条 —— 条目与分组都对着 `wu` 的工具栏。
+        // 工具栏**全宽**（放在菜单条与主区之间）—— 26 个按钮塞进 520px 的编辑区
+        // 会横向溢出，看起来就是「按钮重叠」。`wu` 也是全宽一条。
         let toolbar = {
             let mut bar = h_flex()
                 .id("toolbar")
                 .w_full()
                 .flex_shrink_0()
+                .h(px(36.))
                 .px_2()
-                .py_1()
                 .gap_1()
                 .items_center()
                 .border_b_1()
                 .border_color(theme.border)
-                .bg(theme.secondary)
-                // 按钮多，窄窗口里横向滚，别把按钮挤没
+                .bg(theme.sidebar)
+                // 窄窗口里横向滚，别把按钮挤没
                 .overflow_x_scroll();
 
             for (index, group) in Markup::GROUPS.iter().enumerate() {
@@ -2954,8 +2964,9 @@ impl Render for Previewer {
                         let view = cx.entity();
                         bar = bar.child(
                             Button::new("tb-color")
+                                .flex_shrink_0()
                                 .ghost()
-                                .compact()
+                                .xsmall()
                                 .label("颜色")
                                 .tooltip("包住选中：换这个颜色")
                                 .dropdown_menu(move |menu, window, _cx| {
@@ -2987,8 +2998,9 @@ impl Render for Previewer {
                         let view = cx.entity();
                         bar = bar.child(
                             Button::new("tb-ai")
+                                .flex_shrink_0()
                                 .ghost()
-                                .compact()
+                                .xsmall()
                                 .label("AI")
                                 .dropdown_menu(move |menu, window, _cx| {
                                     let view = view.clone();
@@ -3028,8 +3040,9 @@ impl Render for Previewer {
                             bar = bar.child(
                                 // id 加前缀：工具栏的「图片」与右侧页签的「图片」会撞名
                                 Button::new(format!("tb:{}", kind.label()))
+                                    .flex_shrink_0()
                                     .ghost()
-                                    .compact()
+                                    .xsmall()
                                     .label(kind.label())
                                     .tooltip(kind.hint())
                                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -3066,7 +3079,6 @@ impl Render for Previewer {
                     cx.notify();
                 }),
             )
-            .child(toolbar)
             .child(Input::new(&self.editor).flex_1());
 
         // 布局尺寸一律用 `page_sizes`（按 pt 算出来的），**不用纹理的像素尺寸**。
@@ -3118,7 +3130,9 @@ impl Render for Previewer {
                                 .child(format!("第 {} 页", i + 1))
                                 .into_any_element(),
                         };
-                        div()
+                        let page_no = i + 1;
+                        let current = page_no == self.current_page + 1;
+                        let page = div()
                             // 高亮要绝对定位在页内，所以页框得是定位上下文
                             .relative()
                             .bg(gpui::white())
@@ -3170,6 +3184,28 @@ impl Render for Previewer {
                                         .into_any_element()
                                 })
                             }))
+                            // 分页显示：页码贴在每页下方（不随缩放变大小）
+                            .into_any_element();
+                        v_flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .gap_1()
+                            .child(page)
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(if current {
+                                        theme.foreground
+                                    } else {
+                                        theme.muted_foreground
+                                    })
+                                    .child(if current {
+                                        format!("第 {page_no} 页 / 共 {} 页", self.bitmaps.len())
+                                    } else {
+                                        format!("{page_no} / {}", self.bitmaps.len())
+                                    }),
+                            )
+                            .into_any_element()
                     }),
             );
 
@@ -3201,6 +3237,7 @@ impl Render for Previewer {
             .size_full()
             .bg(theme.background)
             .child(self.render_menu(cx))
+            .child(toolbar)
             .child(
                 h_flex()
                     .flex_1()
@@ -3320,6 +3357,29 @@ impl Render for Previewer {
                 this.set_zoom_anchored(next, cx);
             }))
     }
+}
+
+/// 路径太长时只留末两段（右栏标题用）。
+fn short_path(path: &str) -> String {
+    let parts: Vec<&str> = path.split(['/', '\\']).filter(|p| !p.is_empty()).collect();
+    match parts.len() {
+        0 => path.to_string(),
+        1 => parts[0].to_string(),
+        n => format!("{}/{}", parts[n - 2], parts[n - 1]),
+    }
+}
+
+/// 右栏的「还没内容」占位（纯文本，无按钮）。
+fn placeholder(text: &'static str, theme: &gpui_component::Theme) -> AnyElement {
+    div()
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_sm()
+        .text_color(theme.muted_foreground)
+        .child(text)
+        .into_any_element()
 }
 
 /// 颜色名 → 菜单上的中文（与 `wu` 的叫法一致）。

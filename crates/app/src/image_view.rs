@@ -62,6 +62,11 @@ impl ImageView {
             loading: true,
         }
     }
+
+    /// 当前这张图是哪个文件（右栏标题用）。
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 /// 扩展名 → gpui 图片格式（纯函数，可在后台线程调用）。
