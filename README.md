@@ -80,6 +80,40 @@ ureq + 系统 TLS，不引 tokio）。下载落在 typst 自己的缓存目录
 冷取 452 ms / 热取 0.1 ms。默认**不联网**（`Packages::local_only()`）：
 离线要能编译本地项目，测试也不该碰网络。
 
+### AI 编辑：选中文字 → Ctrl+K → 逐块确认
+
+照 `wu` 的路子做，两处按本项目的取舍改了：
+
+- **诊断不 shell 调外部 `typst`** —— 「语法检查并修复」的诊断来自 `typst-engine`
+  自己（语法诊断 + 编译诊断），我们本来就有增量维护的语法树，不必再起进程
+- **HTTP 走系统 `curl` 子进程**（`-N` 关缓冲跑 SSE）—— 不引 reqwest/tokio：
+  AI 编辑是低频操作，几十毫秒的进程启动开销无所谓，而 tokio 是几 MB 依赖
+  （Windows 10 1803+ 自带 curl；本地模型端点同样只需要 curl）
+
+```
+Ctrl+K            选中文字就改选区，没选就改整篇
+输入一句要求  →   Enter
+               →   右下角显示「已生成 N 字…」（思考模型的长思考也计入进度，Esc 可取消）
+               →   逐块 diff 预览：+ 绿 / - 红
+Enter 应用 · Tab/空格 切换本块 · ↑↓ 选块 · Esc 放弃
+```
+
+「AI」菜单里还有五个固定任务：语法检查并修复 / 中文校对 / 术语一致性 /
+中译英 / 英译中。端点、模型、Key 从 `settings.conf` 的 `ai_base_url` /
+`ai_model` / `ai_api_key` 读（环境变量 `AI_BASE_URL` / `AI_MODEL` /
+`AI_API_KEY` 优先），默认端点 DeepSeek、默认模型 `deepseek-flash`。
+
+三条实现上的硬要求，都写了测试：
+
+| 要求 | 为什么 |
+|---|---|
+| **生成在 std 线程里跑，界面只轮询** | gpui 的 background_executor 池子里还跑着设置防抖、终端事件轮询等定时任务，一次 60 秒的 curl 会把它们一起饿死 |
+| **`apply_hunks` 的行尾跟着原文** | 编辑器里是 CRLF，写死 `\n` 就会「AI 改一句、整篇行尾全变」（git 上等于全改） |
+| **「全部拒绝」逐字节等于原文** | 连结尾多一个换行都算改了文件 —— 用户点拒绝就该什么都不发生 |
+
+curl 的退出码翻译成人话再报（7 = 连不上端点 / 28 = 超时 / 35 = TLS / 60 = 证书），
+直接报「退出码 7」等于没说。
+
 ### 设置存在哪
 
 `%APPDATA%\typst-live\settings.conf`（类 Unix 是 `$HOME/.config/typst-live/`）。

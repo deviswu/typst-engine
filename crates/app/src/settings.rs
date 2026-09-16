@@ -42,6 +42,15 @@ pub struct Settings {
     pub window: Option<WindowBox>,
     pub file: Option<PathBuf>,
     pub zoom: Option<f32>,
+    /// AI 端点（OpenAI 兼容）。留空用内置默认（DeepSeek）。
+    /// 环境变量 `AI_BASE_URL` 优先级更高 —— 便于临时指向本地模型。
+    pub ai_base_url: Option<String>,
+    /// AI 模型名。环境变量 `AI_MODEL` 优先。
+    pub ai_model: Option<String>,
+    /// AI 鉴权 Key。环境变量 `AI_API_KEY` 优先。
+    ///
+    /// 存明文是因为它就是个本地单机工具的配置；真要更严，用环境变量。
+    pub ai_api_key: Option<String>,
     /// 主题名（gpui-component 的 `ThemeRegistry` 里的名字）。
     ///
     /// 亮/暗不用单独存：`Theme::apply_config` 会把配置放进对应那一侧，
@@ -100,6 +109,9 @@ impl Settings {
                 "file" if !value.is_empty() => out.file = Some(PathBuf::from(value)),
                 "zoom" => out.zoom = value.parse::<f32>().ok().filter(|z| z.is_finite()),
                 "theme" if !value.is_empty() => out.theme = Some(value.to_owned()),
+                "ai_base_url" if !value.is_empty() => out.ai_base_url = Some(value.to_owned()),
+                "ai_model" if !value.is_empty() => out.ai_model = Some(value.to_owned()),
+                "ai_api_key" if !value.is_empty() => out.ai_api_key = Some(value.to_owned()),
                 _ => {}
             }
         }
@@ -122,6 +134,15 @@ impl Settings {
         }
         if let Some(theme) = &self.theme {
             out.push_str(&format!("theme={theme}\n"));
+        }
+        if let Some(url) = &self.ai_base_url {
+            out.push_str(&format!("ai_base_url={url}\n"));
+        }
+        if let Some(model) = &self.ai_model {
+            out.push_str(&format!("ai_model={model}\n"));
+        }
+        if let Some(key) = &self.ai_api_key {
+            out.push_str(&format!("ai_api_key={key}\n"));
         }
 
         out
@@ -151,6 +172,9 @@ mod tests {
             file: Some(PathBuf::from("/tmp/docs/报告.typ")),
             zoom: Some(1.25),
             theme: Some("Default Dark".to_owned()),
+            ai_base_url: Some("http://127.0.0.1:11434/v1/chat/completions".to_owned()),
+            ai_model: Some("qwen3".to_owned()),
+            ai_api_key: Some("sk-本地测试".to_owned()),
         }
     }
 
@@ -212,7 +236,15 @@ mod tests {
     fn absent_items_produce_no_lines() {
         let text = Settings::default().render();
 
-        for key in ["window=", "file=", "zoom=", "theme="] {
+        for key in [
+            "window=",
+            "file=",
+            "zoom=",
+            "theme=",
+            "ai_base_url=",
+            "ai_model=",
+            "ai_api_key=",
+        ] {
             assert!(!text.contains(key), "空的设置不该写 `{key}`：{text:?}");
         }
     }

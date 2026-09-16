@@ -32,7 +32,8 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 | L8 | `@preview` 联网取包 | ✅ `Packages::with_downloads()`（typst-kit 的 SystemPackages） |
 | L9 | 长文档首屏（首次排版推迟到开窗之后） | ✅ 窗口先出来，预览区显示「首次排版中…」 |
 | L10 | 界面向 `wu` 对齐：菜单条 · 目录树 · 右侧多视图（预览/Markdown/图片） | ✅ `crates/app/src/{tree,image_view,markdown_view}.rs` |
-| L11 | 终端（alacritty_terminal） · AI 编辑 | 🚧 模块由子代理移植中，接线待做 |
+| L11 | AI 编辑（选中文字 → Ctrl+K → 逐块 diff → 应用） | ✅ `crates/app/src/{ai,diff}.rs` + 浮层接线 |
+| L12 | 终端（alacritty_terminal） | 🚧 待做：模块要自己移（子代理那条路在本机不通） |
 
 - 28 个 commit，8000 行 Rust（36 个 `.rs` 文件），clippy 与 `cargo fmt` 都干净
 - 远端：`github.com/deviswu/typst-engine`（public，`master`，SSH）—— `git push` 即可
@@ -56,10 +57,13 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 
 ## 下一步（按我的推荐排序）
 
-0. **接线终端与 AI**（模块由子代理移植，见 L11）：终端要接成底部面板（可折叠、
-   可调高度）+ `Ctrl+`` 快捷键；AI 要接成「选中文字 → Ctrl+K 打开输入框 →
-   预览 diff → 应用」。两者都参考 `wu/src/terminal_view.rs` 与 `wu/src/main.rs`
-   里 `AiEditState` 那一段。
+0. **终端**（L12）：`wu/src/terminal.rs` + `terminal_view.rs`（1260 行）要自己移过来。
+   接线模式已经摸清：`Terminal::new(&shell, Some(dir), 100, 30)`、
+   自适应轮询事件泵（有输出 50ms / 空闲降到 120ms）、
+   `TerminalElement::new(term, focus, ime).colors(..).palette(..).track_focus(..)`、
+   `ToggleShell` 绑 `ctrl-4` + `.visible(shell_visible)`。
+   注意：**子代理那条路在本机不通**（claude_code 未安装；pi/codex 那条虽然能跑但没产出文件），
+   别再把大块移植外包出去。
 1. **首次排版的过程感** —— 现在只是「推迟 + 一行提示」。177 页要 854 ms，
    可以先把第一页排出来先显示（需要把 `typst::compile` 换成按页/分段的办法，
    或者给首屏用 syntax-only 骨架）—— **先写能复现慢编译的测试再动**。
@@ -108,6 +112,10 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 | `Button::new(("a", "b"))` 编译不过 | `ElementId` 只接受 `&str` / `(&str, EntityId)` 这类，**不接受** `(&str, &str)` | 用 `&str` 当 id（同一栏里标签本来就唯一） |
 | `.selected(bool)` 找不到方法 | 它在 `gpui_component::Selectable` trait 上，不在 `Button` 上 | 把 `Selectable as _` 导进来 |
 | 目录树点一下又展开又收起 | `Tree` 在外层包了一个 `mouse_down` 自己调 `toggle_expand` | 应用侧的回调里只处理「打开文件」，目录直接 return |
+| **AI 改一句，整篇行尾从 CRLF 变成 LF** | `apply_hunks` 重建时写死了 `\n` | 行尾跟着原文走（`old.contains("\r\n")`） |
+| **点了「拒绝」，文件还是被改了** | 重建时无条件补了个结尾换行 | 结尾换行也跟原文一致；「全拒绝」必须逐字节等于原文（有测试） |
+| AI 请求把界面卡住（设置防抖/终端轮询一起停摆） | 阻塞调用丢进 gpui 的 background_executor 池 | 放 `std::thread`，界面只按 100ms 轮询回执 |
+| 报「curl 退出码 7」看不出该怎么办 | 没翻成人话 | 7→连不上端点、28→超时、35→TLS、60→证书 |
 | 右键示例文档报波浪线 | 我写成了 Markdown 的 `**粗体**`，Typst 是 `*...*` | — |
 
 **通用教训**：多窗口桌面上截图对比不可靠（会被别的窗口挡住/干扰），

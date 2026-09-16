@@ -15,6 +15,8 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use gpui::*;
@@ -41,13 +43,16 @@ use typst_engine::syntax as lang;
 use typst_engine::world::{EngineWorld, EntryState, Packages, embedded_and_system_fonts};
 use typst_layout::PagedDocument;
 
+use ai::AiTask;
 use image_view::ImageView;
 use markdown_view::MarkdownView;
 use markup::Markup;
 use settings::Settings;
 use themes::ThemeItem;
 
+mod ai;
 mod coords;
+mod diff;
 mod finder;
 mod image_view;
 mod markdown_view;
@@ -75,6 +80,12 @@ actions!(
         QuickNext,
         QuickCancel,
         SyncToPreview,
+        AiEditOpen,
+        AiSubmit,
+        AiCancel,
+        AiNextHunk,
+        AiPrevHunk,
+        AiToggleHunk,
     ]
 );
 
@@ -194,6 +205,68 @@ struct Status {
     compiles: usize,
     /// 光栅化次数。缩放**会**让它增加。
     rasters: usize,
+}
+
+/// AI 编辑的当前阶段（一个状态机，界面上只画一个浮层，内容随阶段变）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AiStage {
+    /// 没开
+    Closed,
+    /// 正在输入要求
+    Ask,
+    /// 正在生成（可以取消）
+    Running,
+    /// 生成完了，等确认（逐块可切）
+    Review,
+}
+
+/// 「选中文字 → AI 编辑」的全部状态。
+///
+/// 设计要点：**生成在 std 线程里跑，界面只轮询**。
+/// 不用 gpui 的 background_executor 跑这个阻塞调用 —— 那个池子里还跑着
+/// 设置防抖、终端事件轮询等定时任务，一次 60 秒的 curl 会把它们一起饿死。
+struct AiEdit {
+    stage: AiStage,
+    /// 作用范围（字节）。空范围 = 整篇。
+    scope: std::ops::Range<usize>,
+    /// 范围说明（画在浮层上，让人知道 AI 在改哪一段）
+    scope_label: String,
+    /// 原文本（diff 的左边，也是取消时的回滚依据）
+    original: String,
+    /// 模型返回、已剥掉代码围栏的结果
+    result: String,
+    /// 结果与原文本之间的变更块
+    hunks: Vec<diff::Hunk>,
+    /// 每块是否接受（默认全接受，AI 改稿的默认意图是改）
+    accepted: Vec<bool>,
+    /// 当前选中的块（键盘上下移动）
+    selected: usize,
+    /// 已生成多少字（思考模型的耗时主要在思维链上，也计入）
+    progress: Arc<AtomicUsize>,
+    /// 取消标志（置 true 会 kill 掉 curl）
+    cancel: Arc<AtomicBool>,
+    /// 后台线程的回执通道
+    rx: Option<Receiver<Result<String, String>>>,
+    error: Option<String>,
+}
+
+impl Default for AiEdit {
+    fn default() -> Self {
+        Self {
+            stage: AiStage::Closed,
+            scope: 0..0,
+            scope_label: String::new(),
+            original: String::new(),
+            result: String::new(),
+            hunks: Vec::new(),
+            accepted: Vec::new(),
+            selected: 0,
+            progress: Arc::new(AtomicUsize::new(0)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx: None,
+            error: None,
+        }
+    }
 }
 
 /// 左栏显示什么。
@@ -350,6 +423,17 @@ struct Previewer {
     markdown: Entity<MarkdownView>,
     /// 图片视图（打开图片时新建一个）。
     image: Option<Entity<ImageView>>,
+    /// AI 浮层自己的焦点句柄。
+    ///
+    /// 评审阶段输入框已经不画了，若没人持有焦点，gpui 的动作派发就**没有起点**
+    /// （`NEXT.md` 里那个坑：没焦点 = 所有快捷键静默失效），所以浮层自己拿一个。
+    ai_focus: FocusHandle,
+    /// AI 编辑：要求输入框 + 状态
+    ai_input: Entity<InputState>,
+    _ai_sub: Subscription,
+    ai: AiEdit,
+    /// 多轮对话历史（`(是否用户, 文本)`）—— 连续按 Ctrl+K 时模型能记住上文
+    ai_history: Vec<(bool, String)>,
     /// 状态栏那个主题下拉框。
     theme_select: Entity<SelectState<Vec<ThemeItem>>>,
     _theme_sub: Subscription,
@@ -436,6 +520,18 @@ impl Previewer {
             },
         );
 
+        // AI 编辑的要求输入框（与快速打开同一个套路：常驻，开关只切可见性）
+        let ai_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("比如：把这段改得更简洁 ／ 译成英文 ／ 改成表格")
+                .submit_on_enter(true)
+        });
+        let ai_sub = cx.subscribe_in(&ai_input, window, |this, _, event, window, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                this.start_ai(window, cx);
+            }
+        });
+
         let theme_sub = cx.subscribe_in(
             &theme_select,
             window,
@@ -518,6 +614,11 @@ impl Previewer {
             tree_root: None,
             markdown,
             image: None,
+            ai_focus: cx.focus_handle(),
+            ai_input,
+            _ai_sub: ai_sub,
+            ai: AiEdit::default(),
+            ai_history: Vec::new(),
             theme_name,
             theme_select,
             _theme_sub: theme_sub,
@@ -1001,6 +1102,348 @@ impl Previewer {
         cx.notify();
     }
 
+    // ── AI 编辑（Ctrl+K）─────────────────────────────────
+
+    /// Ctrl+K：打开 AI 编辑。有选区就改选区，没有就改整篇。
+    fn open_ai(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let selection = self.editor.read(cx).selected_range();
+        let (scope, label) = if selection.is_empty() {
+            (0..0, "整篇文档".to_string())
+        } else {
+            let text = self.editor.read(cx).text().to_string();
+            let picked = text
+                .get(selection.clone())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let preview: String = picked.chars().take(24).collect();
+            let more = if picked.chars().count() > 24 {
+                "…"
+            } else {
+                ""
+            };
+            (
+                selection.clone(),
+                format!("选区 {} 字：{preview}{more}", picked.chars().count()),
+            )
+        };
+
+        self.ai = AiEdit {
+            stage: AiStage::Ask,
+            scope,
+            scope_label: label,
+            ..AiEdit::default()
+        };
+        self.message = None;
+
+        self.ai_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            state.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Esc / 点空白：关掉 AI 浮层（生成中就顺手取消）。
+    fn cancel_ai(&mut self, cx: &mut Context<Self>) {
+        self.ai.cancel.store(true, Ordering::Relaxed);
+        self.ai = AiEdit::default();
+        self.message = Some("已取消 AI 编辑".to_string());
+        cx.notify();
+    }
+
+    fn ai_move(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.ai.hunks.is_empty() {
+            return;
+        }
+        let last = self.ai.hunks.len() - 1;
+        let next = self.ai.selected as isize + delta;
+        self.ai.selected = next.clamp(0, last as isize) as usize;
+        cx.notify();
+    }
+
+    /// 切换当前块的接受/拒绝 —— AI 的修改往往散在几处，该能逐块要。
+    fn ai_toggle_hunk(&mut self, cx: &mut Context<Self>) {
+        let Some(accepted) = self.ai.accepted.get_mut(self.ai.selected) else {
+            return;
+        };
+        *accepted = !*accepted;
+        let state = if self.ai.accepted[self.ai.selected] {
+            "接受"
+        } else {
+            "拒绝"
+        };
+        self.message = Some(format!("第 {} 块已{state}", self.ai.selected + 1));
+        cx.notify();
+    }
+
+    /// 发请求：把「上下文 + 历史 + 本轮要求」交给模型。
+    ///
+    /// **生成在 std 线程里**（见 `AiEdit` 的注释），界面只按 100ms 轮询回执。
+    fn start_ai(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.ai.stage != AiStage::Ask {
+            return;
+        }
+        let instruction = self.ai_input.read(cx).value().trim().to_string();
+        if instruction.is_empty() {
+            self.message = Some("先说一句要改什么".to_string());
+            cx.notify();
+            return;
+        }
+
+        // 上下文：有选区就只给选区（省钱、也更准），否则给截断过的全文
+        let full = self.editor.read(cx).text().to_string();
+        let raw_context = if self.ai.scope.is_empty() {
+            full.clone()
+        } else {
+            full.get(self.ai.scope.clone())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let (context, truncated) = ai::truncate_context(&raw_context, ai::AI_EDIT_CONTEXT_LIMIT);
+        if truncated {
+            println!(
+                "[typst-live] AI 上下文超限，已截断到 {} 字",
+                ai::AI_EDIT_CONTEXT_LIMIT
+            );
+        }
+
+        let messages = ai::edit_messages(&context, &self.ai_history, &instruction);
+        self.ai_history.push((true, instruction.clone()));
+        self.spawn_ai(messages, raw_context, self.ai.scope.clone(), cx);
+    }
+
+    /// 把一组 messages 交给模型（起 std 线程 + 轮询回执）。两个入口共用：
+    /// `Ctrl+K` 的自由指令，与菜单里的固定任务。
+    fn spawn_ai(
+        &mut self,
+        messages: Vec<(String, String)>,
+        original: String,
+        scope: std::ops::Range<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let base_url = ai::resolve_base_url(self.settings.ai_base_url.as_deref());
+        let model = ai::resolve_model(self.settings.ai_model.as_deref());
+        let key = ai::api_key(&base_url, self.settings.ai_api_key.as_deref());
+
+        // 云端端点没 Key 是**等会儿必然失败**，不如当场说清楚怎么配；
+        // 本地端点（Ollama 之类）本来就不需要 Key。
+        if key.is_none() && !ai::is_local_endpoint(&base_url) {
+            self.message = Some(
+                "AI 需要鉴权：设环境变量 AI_API_KEY，或在 settings.conf 里写 ai_api_key"
+                    .to_string(),
+            );
+        }
+
+        println!(
+            "[typst-live] AI 请求：{model} @ {base_url}（{} 条消息，原文 {} 字）",
+            messages.len(),
+            original.chars().count()
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cancel = self.ai.cancel.clone();
+        let progress = self.ai.progress.clone();
+        std::thread::spawn(move || {
+            let result = ai::chat_messages(
+                &base_url,
+                &model,
+                key.as_deref(),
+                &messages,
+                &cancel,
+                &progress,
+            );
+            // 接收端可能已经走了（用户按了 Esc），发不出去就算了
+            let _ = tx.send(result);
+        });
+
+        self.ai.rx = Some(rx);
+        self.ai.stage = AiStage::Running;
+        self.ai.error = None;
+        self.ai.original = original;
+        self.ai.scope = scope;
+
+        // 轮询回执：100ms 一次，顺带把进度刷到界面上
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+
+                let done = this
+                    .update(cx, |this, cx| this.take_ai_result(cx))
+                    .unwrap_or(true);
+                if done {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        cx.notify();
+    }
+
+    /// 菜单里的固定任务（语法修复 / 校对 / 术语 / 互译）。
+    ///
+    /// 「语法检查并修复」的诊断来自**本项目引擎**（`typst-engine` 的语法诊断 +
+    /// 编译诊断），不像 `wu` 那样 shell 调外部 `typst` CLI —— 我们本来就有
+    /// 一棵增量维护的语法树，没必要为了拿诊断再起进程。
+    fn run_ai_task(&mut self, task: AiTask, window: &mut Window, cx: &mut Context<Self>) {
+        let selection = self.editor.read(cx).selected_range();
+        let (scope, label, source) = if selection.is_empty() {
+            let text = self.editor.read(cx).text().to_string();
+            (0..0, "整篇文档".to_string(), text)
+        } else {
+            let text = self.editor.read(cx).text().to_string();
+            let picked = text.get(selection.clone()).unwrap_or_default().to_string();
+            (
+                selection.clone(),
+                format!("选区 {} 字", picked.chars().count()),
+                picked,
+            )
+        };
+
+        if source.trim().is_empty() {
+            self.message = Some("没有可处理的文字".to_string());
+            cx.notify();
+            return;
+        }
+
+        let errors = self.diagnostic_summary(cx);
+        let prompt = ai::task_prompt(task, &source, &errors);
+        let (context, _) = ai::truncate_context(&source, ai::AI_EDIT_CONTEXT_LIMIT);
+        let messages = vec![
+            (
+                "system".to_string(),
+                "你是专业的 Typst 写作助手，只输出结果本身。".to_string(),
+            ),
+            ("user".to_string(), format!("【当前文本】\n{context}")),
+            ("user".to_string(), prompt),
+        ];
+
+        self.ai = AiEdit {
+            stage: AiStage::Running,
+            scope,
+            scope_label: format!("{} · {label}", task.label()),
+            ..AiEdit::default()
+        };
+        self.ai_history.clear();
+        self.message = Some(format!("AI 任务：{}", task.label()));
+        let _ = window;
+        self.spawn_ai(messages, source, self.ai.scope.clone(), cx);
+        cx.notify();
+    }
+
+    /// 当前诊断的简短摘要（给「语法检查并修复」当输入）。
+    fn diagnostic_summary(&self, cx: &Context<Self>) -> String {
+        let Ok(source) = typst::World::source(&self.engine, self.engine.entry().main()) else {
+            return String::new();
+        };
+
+        let mut diagnostics = lang::syntax_diagnostics(&source);
+        diagnostics.extend(lang::compile_diagnostics(&source, &self.compile_errors));
+
+        let mut out = String::new();
+        for diag in diagnostics.iter().take(20) {
+            let where_ = diag
+                .line_col
+                .map(|p| format!("第 {} 行：", p.line + 1))
+                .unwrap_or_default();
+            out.push_str(&format!("{where_}{}\n", diag.message));
+        }
+        let _ = cx;
+        out
+    }
+
+    /// 看一眼后台线程有没有回执。返回「这条请求是否已经结束」。
+    fn take_ai_result(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(rx) = &self.ai.rx else {
+            return true;
+        };
+
+        let received = match rx.try_recv() {
+            Ok(value) => Some(value),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Some(Err("AI 线程意外结束".to_string()))
+            }
+        };
+
+        let Some(result) = received else {
+            // 还没回来：只重绘，好让进度数字动起来
+            cx.notify();
+            return false;
+        };
+
+        self.ai.rx = None;
+        match result {
+            Ok(reply) => {
+                let cleaned = ai::clean_source(&reply);
+                // 空回复按失败处理，否则会拿一个空串去「应用」掉整段文字
+                if cleaned.trim().is_empty() {
+                    self.ai.error = Some("AI 返回为空".to_string());
+                    self.ai.stage = AiStage::Ask;
+                } else {
+                    self.ai.hunks = diff::hunks(&self.ai.original, &cleaned);
+                    self.ai.accepted = vec![true; self.ai.hunks.len()];
+                    self.ai.selected = 0;
+                    self.ai.result = cleaned.clone();
+                    self.ai.stage = AiStage::Review;
+                    self.ai_history.push((false, cleaned.clone()));
+                    println!(
+                        "[typst-live] AI 返回 {} 字，切成 {} 个可逐块接受的改动",
+                        cleaned.chars().count(),
+                        self.ai.hunks.len()
+                    );
+                }
+            }
+            Err(err) => {
+                self.ai.error = Some(err.clone());
+                self.ai.stage = AiStage::Ask;
+                println!("[typst-live] AI 失败：{err}");
+            }
+        }
+
+        cx.notify();
+        true
+    }
+
+    /// 应用：按接受标记重建那段文字，再拼回全文。
+    fn apply_ai(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.ai.stage != AiStage::Review {
+            return;
+        }
+
+        let applied = diff::apply_hunks(&self.ai.original, &self.ai.result, &self.ai.accepted);
+        let full = self.editor.read(cx).text().to_string();
+
+        let next = if self.ai.scope.is_empty() {
+            applied
+        } else {
+            // 选区模式：把应用后的片段拼回全文
+            let start = self.ai.scope.start.min(full.len());
+            let end = self.ai.scope.end.min(full.len());
+            format!("{}{}{}", &full[..start], applied, &full[end..])
+        };
+
+        let kept = self
+            .ai
+            .accepted
+            .iter()
+            .filter(|accepted| **accepted)
+            .count();
+        let total = self.ai.hunks.len();
+
+        // `set_value` 走的是静默路径（不发 Change 事件），所以自己重排一遍
+        self.editor
+            .update(cx, |state, cx| state.set_value(next, window, cx));
+        self.ai = AiEdit::default();
+        self.dirty = true;
+        self.recompile(cx);
+
+        self.message = Some(format!("AI 改动已应用（{kept}/{total} 块）"));
+        println!("[typst-live] AI 应用：接受 {kept}/{total} 块");
+        cx.notify();
+    }
+
     // ── 双向跳转（双击）──────────────────────────────────────
 
     /// 按需建索引，并按**排版结果**缓存。
@@ -1446,6 +1889,12 @@ impl Previewer {
                             }),
                         ))
                         .separator()
+                        .item(PopupMenuItem::new("AI 编辑…（Ctrl+K）").on_click(
+                            window.listener_for(&view, |this, _, window, cx| {
+                                this.open_ai(window, cx);
+                            }),
+                        ))
+                        .separator()
                         .item(PopupMenuItem::new("退出").on_click(|_, _, cx: &mut App| cx.quit()))
                 })
         };
@@ -1506,6 +1955,37 @@ impl Previewer {
                     })
             };
 
+        let ai_menu = {
+            let view = view.clone();
+            Button::new("menu-ai")
+                .ghost()
+                .compact()
+                .label("AI")
+                .dropdown_menu(move |menu, window, _cx| {
+                    let view = view.clone();
+                    let mut menu = menu.min_w(220.);
+                    menu = menu.item(PopupMenuItem::new("AI 编辑…（Ctrl+K）").on_click(
+                        window.listener_for(&view, |this, _, window, cx| this.open_ai(window, cx)),
+                    ));
+                    menu = menu.separator();
+                    for (label, task) in [
+                        ("语法检查并修复", AiTask::SyntaxFix),
+                        ("中文校对", AiTask::Proofread),
+                        ("术语一致性", AiTask::Terminology),
+                        ("中译英", AiTask::TranslateToEnglish),
+                        ("英译中", AiTask::TranslateToChinese),
+                    ] {
+                        menu = menu.item(PopupMenuItem::new(label).on_click(window.listener_for(
+                            &view,
+                            move |this, _, window, cx| {
+                                this.run_ai_task(task, window, cx);
+                            },
+                        )));
+                    }
+                    menu
+                })
+        };
+
         h_flex()
             .w_full()
             .flex_shrink_0()
@@ -1516,6 +1996,7 @@ impl Previewer {
             .border_color(theme.border)
             .child(file_menu)
             .child(view_menu)
+            .child(ai_menu)
             .child(
                 div()
                     .ml_auto()
@@ -1701,6 +2182,175 @@ impl Previewer {
                     .child(tab("图片", RightPane::Image, cx)),
             )
             .child(div().flex_1().min_h_0().w_full().child(body))
+    }
+
+    /// AI 编辑浮层：输入要求 → 生成中 → 逐块确认。
+    ///
+    /// 三个阶段共用一层壳（标题 + 内容 + 底部提示），只在中间换内容。
+    fn render_ai(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+
+        let (title, hint) = match self.ai.stage {
+            AiStage::Closed => return div().into_any_element(),
+            AiStage::Ask => ("AI 编辑", "Enter 发送 · Esc 取消"),
+            AiStage::Running => ("AI 编辑 · 生成中", "Esc 取消"),
+            AiStage::Review => (
+                "AI 编辑 · 确认改动",
+                "Enter 应用 · Tab/空格 切换本块 · ↑↓ 选块 · Esc 放弃",
+            ),
+        };
+
+        let body: AnyElement = match self.ai.stage {
+            AiStage::Closed => div().into_any_element(),
+
+            AiStage::Ask | AiStage::Running => {
+                let mut column = v_flex().w_full().gap_2();
+                if self.ai.stage == AiStage::Running {
+                    let generated = self.ai.progress.load(Ordering::Relaxed);
+                    column = column.child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.primary)
+                            .child(format!("已生成 {generated} 字…")),
+                    );
+                }
+                column = column.child(Input::new(&self.ai_input).w_full());
+                if let Some(error) = &self.ai.error {
+                    column = column.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.danger)
+                            .child(format!("失败：{error}")),
+                    );
+                }
+                column.into_any_element()
+            }
+
+            AiStage::Review => {
+                let mut list = v_flex()
+                    .id("ai-hunks")
+                    .w_full()
+                    .gap_1()
+                    .max_h(px(380.))
+                    .overflow_y_scroll();
+                for (index, hunk) in self.ai.hunks.iter().enumerate() {
+                    let accepted = self.ai.accepted.get(index).copied().unwrap_or(true);
+                    let selected = index == self.ai.selected;
+
+                    let mut block = v_flex()
+                        .w_full()
+                        .rounded(theme.radius)
+                        .px_2()
+                        .py_1()
+                        .gap_0p5()
+                        .bg(if selected {
+                            theme.accent.opacity(0.18)
+                        } else {
+                            theme.secondary
+                        })
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .text_xs()
+                                .child(div().text_color(theme.primary).child(format!(
+                                    "第 {} 块  +{}  -{}",
+                                    index + 1,
+                                    hunk.added(),
+                                    hunk.removed()
+                                )))
+                                .child(
+                                    div()
+                                        .text_color(if accepted {
+                                            theme.success
+                                        } else {
+                                            theme.muted_foreground
+                                        })
+                                        .child(if accepted { "接受" } else { "拒绝" }),
+                                ),
+                        );
+
+                    for line in &hunk.lines {
+                        let (sign, color) = match line.kind {
+                            diff::DiffKind::Add => ("+", theme.success),
+                            diff::DiffKind::Del => ("-", theme.danger),
+                        };
+                        block = block.child(
+                            div()
+                                .text_xs()
+                                .font_family(theme.mono_font_family.clone())
+                                .text_color(color)
+                                .child(format!("{sign} {}", line.text)),
+                        );
+                    }
+
+                    list = list.child(block);
+                }
+
+                if self.ai.hunks.is_empty() {
+                    list = list.child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child("模型返回的内容与原文本一致（没有可应用的改动）"),
+                    );
+                }
+
+                list.into_any_element()
+            }
+        };
+
+        let panel = v_flex()
+            .key_context("AiEdit")
+            .track_focus(&self.ai_focus)
+            .w(px(700.))
+            .max_h(px(560.))
+            .gap_2()
+            .p_3()
+            .bg(theme.background)
+            .border_1()
+            .border_color(theme.border)
+            .rounded_md()
+            .shadow_lg()
+            .overflow_hidden()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_sm().child(title))
+                    .child(
+                        div()
+                            .ml_auto()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(self.ai.scope_label.clone()),
+                    ),
+            )
+            .child(body)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(hint),
+            );
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .justify_center()
+            .items_start()
+            .pt(px(90.))
+            .bg(gpui::black().opacity(0.25))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| this.cancel_ai(cx)),
+            )
+            .child(panel)
+            .into_any_element()
     }
 
     fn render_statusbar(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -2013,6 +2663,12 @@ impl Previewer {
 
 impl Render for Previewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // AI 评审阶段把焦点拿到浮层上：gpui 的动作派发**从聚焦节点开始**，
+        // 没有焦点就没有起点（NEXT.md 里那个坑：所有快捷键静默失效）。
+        if self.ai.stage == AiStage::Review && !self.ai_focus.is_focused(window) {
+            self.ai_focus.focus(window, cx);
+        }
+
         // 首次排版**推迟到这一帧画完之后**再跑：先让窗口出现（带一句
         // 「首次排版中…」），别让用户盯着一个还没画出来的窗口等 200+ ms。
         if self.first_compile {
@@ -2262,6 +2918,7 @@ impl Render for Previewer {
             )
             // 浮层放在最后，才能盖在内容之上
             .children(self.quick_visible.then(|| self.render_quick_open(cx)))
+            .children((self.ai.stage != AiStage::Closed).then(|| self.render_ai(cx)))
             .on_action(cx.listener(|this, _: &ZoomIn, _window, cx| {
                 let next = this.zoom * ZOOM_STEP;
                 this.set_zoom(next, cx);
@@ -2301,6 +2958,28 @@ impl Render for Previewer {
             }))
             .on_action(cx.listener(|this, _: &SyncToPreview, _window, cx| {
                 this.jump_to_preview(cx);
+            }))
+            .on_action(cx.listener(|this, _: &AiEditOpen, window, cx| {
+                this.open_ai(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &AiSubmit, window, cx| {
+                if this.ai.stage == AiStage::Review {
+                    this.apply_ai(window, cx);
+                } else {
+                    this.start_ai(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &AiCancel, _window, cx| {
+                this.cancel_ai(cx);
+            }))
+            .on_action(cx.listener(|this, _: &AiNextHunk, _window, cx| {
+                this.ai_move(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &AiPrevHunk, _window, cx| {
+                this.ai_move(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &AiToggleHunk, _window, cx| {
+                this.ai_toggle_hunk(cx);
             }))
             .on_action(cx.listener(|this, _: &QuickOpen, window, cx| {
                 this.show_quick_open(window, cx);
@@ -2417,6 +3096,14 @@ fn main() {
             KeyBinding::new("ctrl-e", ExportPdf, None),
             // 前向跳转的键盘版（双击是鼠标版；“双击选词”不该是唯一入口）
             KeyBinding::new("ctrl-alt-j", SyncToPreview, None),
+            // AI 编辑。Enter/Tab/空格/Esc 只在浮层内生效（按键上下文限定），
+            // 否则会把编辑器自己的按键抢走。
+            KeyBinding::new("ctrl-k", AiEditOpen, None),
+            KeyBinding::new("enter", AiSubmit, Some("AiEdit")),
+            KeyBinding::new("tab", AiNextHunk, Some("AiEdit")),
+            KeyBinding::new("shift-tab", AiPrevHunk, Some("AiEdit")),
+            KeyBinding::new("space", AiToggleHunk, Some("AiEdit")),
+            KeyBinding::new("escape", AiCancel, Some("AiEdit")),
             KeyBinding::new("pageup", PrevPage, None),
             KeyBinding::new("pagedown", NextPage, None),
             KeyBinding::new("ctrl-home", FirstPage, None),
