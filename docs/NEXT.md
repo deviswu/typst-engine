@@ -129,6 +129,7 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 | 点标签的 `×` 会把标签也切一下 | 点击事件冒泡到外层标签（它也有 on_click） | 子元素里先 `cx.stop_propagation()` |
 | `no method named on_click found for Div` | gpui 的 `on_click` 在 `StatefulInteractiveElement` 上，元素得有 `id` | 先 `.id(("tab", index))` |
 | `ResizablePanelGroup` 上不能 `.flex_1()` | 它没实现 `Styled`，但自己的 render 里已经 `size_full + flex_1` | 直接当 flex 子项放 |
+| **分区拖窄后编辑区盖到侧栏上** | 三件事凑一起：面板没有 `size_range` 下限、内容 `min-width:auto` 不肯变小、外层没 `overflow_hidden` | 三样都补上（下限 300px + `min_w_0` + `overflow_hidden`） |
 | 右键示例文档报波浪线 | 我写成了 Markdown 的 `**粗体**`，Typst 是 `*...*` | — |
 
 **子代理（AgentShell）在这台机器上能不能用**（2026-09-16 实测，别再重复试）：

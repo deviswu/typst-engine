@@ -2156,7 +2156,7 @@ impl Previewer {
                     .gap_1()
                     .px_2()
                     .py_0p5()
-                    .rounded(theme.radius)
+                    // 标签页是**方角**（不要圆角）：一排气块的边界要清楚
                     .cursor_pointer()
                     .text_xs()
                     .bg(if active {
@@ -2178,7 +2178,6 @@ impl Previewer {
                         div()
                             .id(("tab-close", index))
                             .px_1()
-                            .rounded(theme.radius)
                             .hover(|style| style.bg(theme.danger.opacity(0.25)))
                             .child("×")
                             .on_click(cx.listener(move |this, _, window, cx| {
@@ -2474,21 +2473,22 @@ impl Previewer {
         };
 
         v_flex()
-            .w(px(240.))
             .h_full()
-            .flex_shrink_0()
+            .min_w_0()
+            .overflow_hidden()
             .border_r_1()
             .border_color(theme.border)
             .child(
                 h_flex()
                     .w_full()
+                    .flex_shrink_0()
                     .px_2()
                     .py_1()
                     .gap_1()
                     .border_b_1()
                     .border_color(theme.border)
-                    .child(tab("大纲", Sidebar::Outline, cx))
                     .child(tab("目录", Sidebar::Tree, cx))
+                    .child(tab("大纲", Sidebar::Outline, cx))
                     .child(
                         div().ml_auto().child(
                             Button::new("tree-refresh")
@@ -3328,6 +3328,8 @@ impl Render for Previewer {
         let editor_pane = v_flex()
             .h_full()
             .min_w_0()
+            // 内容不许溢出：拖窄时该裁剪，而不是盖到左边的目录/大纲上
+            .overflow_hidden()
             .bg(theme.background)
             // 双击编辑区 → 显示区。
             //
@@ -3494,11 +3496,25 @@ impl Render for Previewer {
                 // flex_1 + min_h_0/min_w_0`，所以这里**不要**再调 flex_1（它没有
                 // 实现 Styled，调了也编译不过），直接当 flex 子项放就行。
                 h_resizable("main-split")
-                    .child(resizable_panel().size(px(240.)).child(sidebar_pane))
-                    .child(resizable_panel().size(px(520.)).child(editor_pane))
+                    .child(
+                        // 侧栏给个尺寸范围：拖到过窄会把文字挤爆
+                        resizable_panel()
+                            .size(px(240.))
+                            .size_range(px(160.)..px(420.))
+                            .child(sidebar_pane),
+                    )
+                    .child(
+                        // 编辑区同理：**下限定得比内容最小宽度大**，否则拖到很窄时
+                        // 内容（Input）会溢出到左边的侧栏上，看起来就是「覆盖目录大纲」
+                        resizable_panel()
+                            .size(px(520.))
+                            .size_range(px(300.)..px(2400.))
+                            .child(editor_pane),
+                    )
                     .child(
                         resizable_panel()
                             .size(px(640.))
+                            .size_range(px(320.)..px(2400.))
                             .child(self.render_right_pane(preview_pane, cx)),
                     ),
             )
