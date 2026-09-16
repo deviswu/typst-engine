@@ -520,6 +520,10 @@ impl Previewer {
             InputState::new(window, cx)
                 .multi_line(true)
                 .code_editor("typst")
+                // ★ 关掉软换行：**默认是 true**，于是长行被折断成好几行。
+                // 代码编辑器里这很碍事（缩进层级、表格、公式全被搓乱），
+                // 关掉之后 gpui-component 会自动出横向滚动条。
+                .soft_wrap(false)
                 .default_value(source)
         });
 
@@ -3499,21 +3503,23 @@ impl Render for Previewer {
                     .child(
                         // 侧栏给个尺寸范围：拖到过窄会把文字挤爆
                         resizable_panel()
-                            .size(px(240.))
+                            .size(px(200.))
                             .size_range(px(160.)..px(420.))
                             .child(sidebar_pane),
                     )
                     .child(
                         // 编辑区同理：**下限定得比内容最小宽度大**，否则拖到很窄时
                         // 内容（Input）会溢出到左边的侧栏上，看起来就是「覆盖目录大纲」
+                        // 编辑区拿最大份额（800/1520 ≈ 53%）：它才是天天用的那块。
+                        // 展示区小一点没关系 —— 预览是「适应宽度」，自己会缩。
                         resizable_panel()
-                            .size(px(520.))
-                            .size_range(px(300.)..px(2400.))
+                            .size(px(800.))
+                            .size_range(px(360.)..px(2400.))
                             .child(editor_pane),
                     )
                     .child(
                         resizable_panel()
-                            .size(px(640.))
+                            .size(px(520.))
                             .size_range(px(320.)..px(2400.))
                             .child(self.render_right_pane(preview_pane, cx)),
                     ),
