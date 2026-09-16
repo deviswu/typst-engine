@@ -28,6 +28,14 @@ codebook-tree-sitter-typst = "0.12.1"
 # 版本号取自 zed workspace 根 Cargo.toml（image = "0.25.1"）。
 image = { version = "0.25.1", default-features = false }
 
+# 终端：Zed 同款终端核心（wu 用的同一个 crate）。自带 pty。
+alacritty_terminal = "0.26"
+
+# AI 编辑：请求体/响应 JSON 解析。HTTP 本身走系统 curl，不引重型 HTTP 客户端
+# （与 wu 同一条路子）。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
 [dev-dependencies]
 # finder 的扫描测试要造临时目录
 tempfile = "3"

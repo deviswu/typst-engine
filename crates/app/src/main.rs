@@ -12,6 +12,7 @@
 //! 「排版 N 次 / 光栅化 M 次」两个计数会把这件事直接显示出来 ——
 //! 按 Ctrl+= 缩放时你只会看到后一个数在涨。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,8 +23,14 @@ use gpui_component::highlighter::{
     Diagnostic as Squiggle, DiagnosticSeverity, LanguageConfig, LanguageRegistry,
 };
 use gpui_component::input::{Input, InputEvent, InputState, Position};
+use gpui_component::list::ListItem;
+use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::select::{Select, SelectEvent, SelectState};
-use gpui_component::{ActiveTheme as _, IndexPath, Root, RopeExt as _, h_flex, v_flex};
+use gpui_component::tree::{Tree, TreeEvent, TreeState};
+use gpui_component::{
+    ActiveTheme as _, Icon, IconName, IndexPath, Root, RopeExt as _, Selectable as _, h_flex,
+    v_flex,
+};
 
 use typst::diag::SourceDiagnostic;
 use typst::foundations::Bytes;
@@ -34,15 +41,20 @@ use typst_engine::syntax as lang;
 use typst_engine::world::{EngineWorld, EntryState, Packages, embedded_and_system_fonts};
 use typst_layout::PagedDocument;
 
+use image_view::ImageView;
+use markdown_view::MarkdownView;
 use markup::Markup;
 use settings::Settings;
 use themes::ThemeItem;
 
 mod coords;
 mod finder;
+mod image_view;
+mod markdown_view;
 mod markup;
 mod settings;
 mod themes;
+mod tree;
 
 actions!(
     typst_live,
@@ -184,6 +196,26 @@ struct Status {
     rasters: usize,
 }
 
+/// 左栏显示什么。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sidebar {
+    /// 文档大纲（本文档的标题树）。
+    Outline,
+    /// 项目目录树。
+    Tree,
+}
+
+/// 右侧主区显示什么。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RightPane {
+    /// 排版预览（位图纹理）。
+    Preview,
+    /// Markdown 渲染（真正的文本层，可选可复制）。
+    Markdown,
+    /// 图片查看。
+    Image,
+}
+
 /// 跳转索引 + 它是为哪一份排版结果建的。
 ///
 /// `Arc` 指针相同就说明排版结果没换，索引可以直接用 —— 于是
@@ -303,6 +335,21 @@ struct Previewer {
     theme_name: Option<String>,
     /// 首次排版还没做（推迟到窗口画出来之后，见 `render`）。
     first_compile: bool,
+    /// 左栏模式（大纲 / 目录树）。
+    sidebar: Sidebar,
+    /// 右侧主区模式（预览 / Markdown / 图片）。
+    right: RightPane,
+    /// 目录树状态（gpui-component 的 `Tree`）。
+    tree_state: Entity<TreeState>,
+    _tree_sub: Subscription,
+    /// 目录树的展开集合 —— 重建条目时按 id 恢复，不然每次刷新都塌回去。
+    tree_expanded: HashSet<String>,
+    /// 目录树最近一次扫描的根；变了才重扫。
+    tree_root: Option<PathBuf>,
+    /// Markdown 视图（打开 .md 时喂给它）。
+    markdown: Entity<MarkdownView>,
+    /// 图片视图（打开图片时新建一个）。
+    image: Option<Entity<ImageView>>,
     /// 状态栏那个主题下拉框。
     theme_select: Entity<SelectState<Vec<ThemeItem>>>,
     _theme_sub: Subscription,
@@ -361,11 +408,34 @@ impl Previewer {
             }
         }
 
+        // 目录树状态（扫描在 `refresh_tree` 里做，这里只建壳）
+        let tree_state = cx.new(|cx| TreeState::new(cx));
+        // Markdown 视图（打开 .md 时喂源码）
+        let markdown = cx.new(MarkdownView::new);
+
         // 主题下拉框。列表在启动时抓一次：主题文件改了要重启才看得见。
         let current_theme = cx.theme().theme_name().to_string();
         let theme_items = ThemeItem::all(&current_theme, cx);
         let theme_path = ThemeItem::index_of(&theme_items).map(|row| IndexPath::default().row(row));
         let theme_select = cx.new(|cx| SelectState::new(theme_items, theme_path, window, cx));
+        // 目录树的展开状态得记下来：刷新（重建条目）时要按它恢复，
+        // 否则每点一次「刷新」整棵树都塌回去。
+        let tree_sub = cx.subscribe_in(
+            &tree_state,
+            window,
+            |this, _, event: &TreeEvent, _window, cx| {
+                match event {
+                    TreeEvent::Expanded(id) => {
+                        this.tree_expanded.insert(id.to_string());
+                    }
+                    TreeEvent::Collapsed(id) => {
+                        this.tree_expanded.remove(id.as_ref());
+                    }
+                }
+                cx.notify();
+            },
+        );
+
         let theme_sub = cx.subscribe_in(
             &theme_select,
             window,
@@ -440,6 +510,14 @@ impl Previewer {
             settings_writes: 0,
             explicit_file,
             first_compile: true,
+            sidebar: Sidebar::Outline,
+            right: RightPane::Preview,
+            tree_state,
+            _tree_sub: tree_sub,
+            tree_expanded: HashSet::new(),
+            tree_root: None,
+            markdown,
+            image: None,
             theme_name,
             theme_select,
             _theme_sub: theme_sub,
@@ -1195,8 +1273,23 @@ impl Previewer {
             }
         };
 
+        self.quick_visible = false;
+        let label = rel.to_string_lossy().replace('\\', "/");
+        self.open_in_editor(full, text, label, window, cx);
+    }
+
+    /// 在编辑器里打开一个文本文件。目录树点击与快速打开共用它。
+    fn open_in_editor(
+        &mut self,
+        full: PathBuf,
+        text: String,
+        label: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if full == self.main_path {
-            self.cancel_quick(cx);
+            self.message = Some(format!("已经在编辑 {label}"));
+            cx.notify();
             return;
         }
 
@@ -1214,8 +1307,7 @@ impl Previewer {
         // 置空是为了让下面的 recompile 不受「文本没变就不排」的干扰
         self.last_text = String::new();
 
-        self.quick_visible = false;
-        let label = rel.to_string_lossy().replace('\\', "/");
+        self.right = RightPane::Preview;
         self.message = Some(format!("打开 {label}"));
 
         self.editor.update(cx, |state, cx| {
@@ -1225,12 +1317,390 @@ impl Previewer {
         self.recompile(cx);
     }
 
+    // ── 目录树 / 左栏 / 右侧主区 ─────────────────────────
+
+    fn set_sidebar(&mut self, mode: Sidebar, cx: &mut Context<Self>) {
+        self.sidebar = mode;
+        if mode == Sidebar::Tree {
+            self.refresh_tree(cx);
+        }
+        cx.notify();
+    }
+
+    fn set_right(&mut self, mode: RightPane, cx: &mut Context<Self>) {
+        self.right = mode;
+        cx.notify();
+    }
+
+    /// 扫项目目录 → 重建目录树条目（按 `tree_expanded` 恢复展开状态）。
+    fn refresh_tree(&mut self, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        let started = Instant::now();
+        let nodes = tree::scan_dir(&root);
+        let count = tree::count_nodes(&nodes);
+        let items = tree::build_file_items(&root, nodes, &self.tree_expanded);
+        self.tree_root = Some(root.clone());
+        self.tree_state
+            .update(cx, |state, cx| state.set_items(items, cx));
+
+        println!(
+            "[typst-live] 目录树：{count} 个条目，用时 {:.1} ms（{}）",
+            started.elapsed().as_secs_f64() * 1000.0,
+            root.display()
+        );
+    }
+
+    /// 打开一个文件（目录树点击走这里）：按类型决定显示到哪里。
+    ///
+    /// - 图片 → 右侧图片视图
+    /// - `.md` → 右侧 Markdown 渲染（**可选中可复制**，位图预览做不到）
+    /// - 其它文本 → 编辑器（右侧回到排版预览）
+    fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if image_view::is_image_path(&path) {
+            self.image = Some(cx.new(|cx| ImageView::new(path.clone(), cx)));
+            self.right = RightPane::Image;
+            self.message = Some(format!(
+                "图片 {}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            cx.notify();
+            return;
+        }
+
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let label = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                let is_markdown = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("md"));
+
+                if is_markdown {
+                    let full = path.to_string_lossy().to_string();
+                    self.markdown
+                        .update(cx, |view, cx| view.set_source(full, text, cx));
+                    self.right = RightPane::Markdown;
+                    self.message = Some(format!("Markdown {label}"));
+                    cx.notify();
+                } else {
+                    self.open_in_editor(path, text, label, window, cx);
+                }
+            }
+            Err(err) => {
+                self.message = Some(format!("打不开 {}：{err}", path.display()));
+                cx.notify();
+            }
+        }
+    }
+
     /// Esc / 点空白：关掉，不动已打开的文件。
     fn cancel_quick(&mut self, cx: &mut Context<Self>) {
         self.quick_visible = false;
         self.quick_matches.clear();
         self.quick_selected = 0;
         cx.notify();
+    }
+
+    /// 顶部菜单条（文件 / 视图）。
+    ///
+    /// 用 gpui-component 的 `dropdown_menu` —— 与 `wu` 同一个路子。
+    fn render_menu(&self, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let view = cx.entity();
+
+        let file_menu = {
+            let view = view.clone();
+            Button::new("menu-file")
+                .ghost()
+                .compact()
+                .label("文件")
+                .dropdown_menu(move |menu, window, _cx| {
+                    let view = view.clone();
+                    menu.min_w(220.)
+                        .item(PopupMenuItem::new("快速打开…（Ctrl+P）").on_click(
+                            window.listener_for(&view, |this, _, window, cx| {
+                                this.show_quick_open(window, cx);
+                            }),
+                        ))
+                        .separator()
+                        .item(
+                            PopupMenuItem::new("保存（Ctrl+S）").on_click(window.listener_for(
+                                &view,
+                                |this, _, _window, cx| {
+                                    this.save_file(cx);
+                                },
+                            )),
+                        )
+                        .item(PopupMenuItem::new("重新编译（Ctrl+B）").on_click(
+                            window.listener_for(&view, |this, _, _window, cx| {
+                                this.recompile_now(cx);
+                            }),
+                        ))
+                        .item(PopupMenuItem::new("导出 PDF（Ctrl+E）").on_click(
+                            window.listener_for(&view, |this, _, _window, cx| {
+                                this.export_pdf(cx);
+                            }),
+                        ))
+                        .separator()
+                        .item(PopupMenuItem::new("退出").on_click(|_, _, cx: &mut App| cx.quit()))
+                })
+        };
+
+        let view_menu =
+            {
+                let view = view.clone();
+                Button::new("menu-view")
+                    .ghost()
+                    .compact()
+                    .label("视图")
+                    .dropdown_menu(move |menu, window, _cx| {
+                        let view = view.clone();
+                        menu.min_w(220.)
+                            .item(PopupMenuItem::new("大纲").on_click(
+                                window.listener_for(&view, |this, _, _window, cx| {
+                                    this.set_sidebar(Sidebar::Outline, cx)
+                                }),
+                            ))
+                            .item(PopupMenuItem::new("目录树").on_click(
+                                window.listener_for(&view, |this, _, _window, cx| {
+                                    this.set_sidebar(Sidebar::Tree, cx)
+                                }),
+                            ))
+                            .separator()
+                            .item(PopupMenuItem::new("排版预览").on_click(
+                                window.listener_for(&view, |this, _, _window, cx| {
+                                    this.set_right(RightPane::Preview, cx)
+                                }),
+                            ))
+                            .item(
+                                PopupMenuItem::new("刷新目录树").on_click(window.listener_for(
+                                    &view,
+                                    |this, _, _window, cx| {
+                                        this.refresh_tree(cx);
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                            .separator()
+                            .item(PopupMenuItem::new("放大（Ctrl+=）").on_click(
+                                window.listener_for(&view, |this, _, _window, cx| {
+                                    let next = this.zoom * ZOOM_STEP;
+                                    this.set_zoom(next, cx);
+                                }),
+                            ))
+                            .item(PopupMenuItem::new("缩小（Ctrl+-）").on_click(
+                                window.listener_for(&view, |this, _, _window, cx| {
+                                    let next = this.zoom / ZOOM_STEP;
+                                    this.set_zoom(next, cx);
+                                }),
+                            ))
+                            .item(PopupMenuItem::new("实际大小（Ctrl+0）").on_click(
+                                window.listener_for(&view, |this, _, _window, cx| {
+                                    this.set_zoom(1.0, cx);
+                                }),
+                            ))
+                    })
+            };
+
+        h_flex()
+            .w_full()
+            .flex_shrink_0()
+            .px_2()
+            .py_0p5()
+            .gap_1()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(file_menu)
+            .child(view_menu)
+            .child(
+                div()
+                    .ml_auto()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(self.main_path.display().to_string()),
+            )
+    }
+
+    /// 左栏：大纲 / 目录树（顶部两个页签切换）。
+    fn render_sidebar(&self, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+
+        let tab = |label: &'static str, mode: Sidebar, cx: &Context<Self>| {
+            Button::new(label)
+                .ghost()
+                .compact()
+                .label(label)
+                .selected(self.sidebar == mode)
+                .on_click(cx.listener(move |this, _, _window, cx| this.set_sidebar(mode, cx)))
+        };
+
+        let body = match self.sidebar {
+            Sidebar::Outline => self.render_outline_body(cx),
+            Sidebar::Tree => self.render_tree_body(cx),
+        };
+
+        v_flex()
+            .w(px(240.))
+            .h_full()
+            .flex_shrink_0()
+            .border_r_1()
+            .border_color(theme.border)
+            .child(
+                h_flex()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(tab("大纲", Sidebar::Outline, cx))
+                    .child(tab("目录", Sidebar::Tree, cx))
+                    .child(
+                        div().ml_auto().child(
+                            Button::new("tree-refresh")
+                                .ghost()
+                                .compact()
+                                .icon(IconName::Redo)
+                                .tooltip("重新扫描项目目录")
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    this.refresh_tree(cx);
+                                    cx.notify();
+                                })),
+                        ),
+                    ),
+            )
+            .child(body)
+    }
+
+    /// 目录树本体：点文件 → 按类型显示到右侧。
+    fn render_tree_body(&self, cx: &Context<Self>) -> AnyElement {
+        if self.tree_root.is_none() {
+            return div()
+                .flex_1()
+                .p_3()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child("还没有扫描目录 —— 点右上角的刷新")
+                .into_any_element();
+        }
+
+        let view = cx.entity();
+        Tree::new(
+            &self.tree_state,
+            move |ix, entry, _selected, _window, cx| {
+                // `render_item` 拿到的是 `&mut App`，要 `Context<Self>` 才能挂点击回调；
+                // 借 `view.update` 换一个上下文出来（gpui-component 自己的 story 也这么写）。
+                view.update(cx, |_, cx| {
+                    let icon: AnyElement = if entry.is_folder() {
+                        let name = if entry.is_expanded() {
+                            IconName::FolderOpen
+                        } else {
+                            IconName::Folder
+                        };
+                        Icon::from(name)
+                            .text_color(cx.theme().primary)
+                            .into_any_element()
+                    } else {
+                        tree::file_type_icon(Path::new(entry.item().id.as_ref()))
+                    };
+
+                    let path = PathBuf::from(entry.item().id.as_ref());
+                    ListItem::new(ix)
+                        .w_full()
+                        .rounded(cx.theme().radius)
+                        .px_2()
+                        .pl(px(12.) * entry.depth() + px(6.))
+                        .child(
+                            h_flex()
+                                .gap_1p5()
+                                .items_center()
+                                .child(icon)
+                                .child(entry.item().label.clone()),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            // 目录的展开/收起由 Tree 自己做了（它在外层包了一个
+                            // mouse_down 调 toggle），这里只管打开文件
+                            if path.is_dir() {
+                                return;
+                            }
+                            this.open_path(path.clone(), window, cx);
+                        }))
+                })
+            },
+        )
+        .flex_1()
+        .into_any_element()
+    }
+
+    /// 右侧主区：预览 / Markdown / 图片（顶部页签切换）。
+    fn render_right_pane(&self, preview: AnyElement, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+
+        let tab = |label: &'static str, mode: RightPane, cx: &Context<Self>| {
+            Button::new(label)
+                .ghost()
+                .compact()
+                .label(label)
+                .selected(self.right == mode)
+                .on_click(cx.listener(move |this, _, _window, cx| this.set_right(mode, cx)))
+        };
+
+        let body: AnyElement = match self.right {
+            RightPane::Preview => preview,
+            RightPane::Markdown => {
+                if self.markdown.read(cx).is_empty() {
+                    div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .child("在左边目录树里点一个 .md 文件")
+                        .into_any_element()
+                } else {
+                    div()
+                        .size_full()
+                        .child(self.markdown.clone())
+                        .into_any_element()
+                }
+            }
+            RightPane::Image => match &self.image {
+                Some(view) => div().size_full().child(view.clone()).into_any_element(),
+                None => div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child("在左边目录树里点一张图片（png/jpg/webp/gif/bmp/svg）")
+                    .into_any_element(),
+            },
+        };
+
+        v_flex()
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .child(
+                h_flex()
+                    .w_full()
+                    .flex_shrink_0()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(tab("排版预览", RightPane::Preview, cx))
+                    .child(tab("Markdown", RightPane::Markdown, cx))
+                    .child(tab("图片", RightPane::Image, cx)),
+            )
+            .child(div().flex_1().min_h_0().w_full().child(body))
     }
 
     fn render_statusbar(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -1319,8 +1789,8 @@ impl Previewer {
         v_flex().w_full().child(bar).child(info)
     }
 
-    /// 左侧大纲栏。
-    fn render_outline(&self, cx: &Context<Self>) -> impl IntoElement {
+    /// 大纲本体（左栏的标题与边框由 `render_sidebar` 统一负责）。
+    fn render_outline_body(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
 
         let body = v_flex()
@@ -1375,22 +1845,7 @@ impl Previewer {
                     .collect()
             });
 
-        v_flex()
-            .w(px(228.))
-            .h_full()
-            .flex_shrink_0()
-            .border_r_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .text_sm()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child("大纲"),
-            )
-            .child(body)
+        body.into_any_element()
     }
 
     fn render_errors(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -1616,7 +2071,7 @@ impl Render for Previewer {
         let theme = cx.theme();
         let has_errors = !self.compile_errors.is_empty();
 
-        let outline_pane = self.render_outline(cx);
+        let sidebar_pane = self.render_sidebar(cx);
 
         // 工具栏：一键插入。放编辑区上方（`wu` 也是这么放的）。
         let toolbar = h_flex()
@@ -1794,15 +2249,16 @@ impl Render for Previewer {
         v_flex()
             .size_full()
             .bg(theme.background)
+            .child(self.render_menu(cx))
             .child(self.render_statusbar(cx))
             .child(
                 h_flex()
                     .flex_1()
                     .w_full()
                     .overflow_hidden()
-                    .child(outline_pane)
+                    .child(sidebar_pane)
                     .child(editor_pane)
-                    .child(preview_pane),
+                    .child(self.render_right_pane(preview_pane, cx)),
             )
             // 浮层放在最后，才能盖在内容之上
             .children(self.quick_visible.then(|| self.render_quick_open(cx)))

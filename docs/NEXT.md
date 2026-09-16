@@ -31,6 +31,8 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 | L7 | 外壳体验：设置持久化 · 链接可点 · 主题切换 · 工具栏 | ✅ `crates/app/src/{settings,themes,coords,markup}.rs` |
 | L8 | `@preview` 联网取包 | ✅ `Packages::with_downloads()`（typst-kit 的 SystemPackages） |
 | L9 | 长文档首屏（首次排版推迟到开窗之后） | ✅ 窗口先出来，预览区显示「首次排版中…」 |
+| L10 | 界面向 `wu` 对齐：菜单条 · 目录树 · 右侧多视图（预览/Markdown/图片） | ✅ `crates/app/src/{tree,image_view,markdown_view}.rs` |
+| L11 | 终端（alacritty_terminal） · AI 编辑 | 🚧 模块由子代理移植中，接线待做 |
 
 - 28 个 commit，8000 行 Rust（36 个 `.rs` 文件），clippy 与 `cargo fmt` 都干净
 - 远端：`github.com/deviswu/typst-engine`（public，`master`，SSH）—— `git push` 即可
@@ -54,6 +56,10 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 
 ## 下一步（按我的推荐排序）
 
+0. **接线终端与 AI**（模块由子代理移植，见 L11）：终端要接成底部面板（可折叠、
+   可调高度）+ `Ctrl+`` 快捷键；AI 要接成「选中文字 → Ctrl+K 打开输入框 →
+   预览 diff → 应用」。两者都参考 `wu/src/terminal_view.rs` 与 `wu/src/main.rs`
+   里 `AiEditState` 那一段。
 1. **首次排版的过程感** —— 现在只是「推迟 + 一行提示」。177 页要 854 ms，
    可以先把第一页排出来先显示（需要把 `typst::compile` 换成按页/分段的办法，
    或者给首屏用 syntax-only 骨架）—— **先写能复现慢编译的测试再动**。
@@ -99,6 +105,9 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 | 工具栏插入后预览不更新 | gpui-component 的 `insert` / `replace` 走**静默**路径（不发 `InputEvent::Change`） | 自己 `recompile()`（`format_document` 同一条） |
 | `@preview` 那行正文报 label 不存在 | 正文里的 `@preview` 被当成**标签引用**（`@name` 是引用语法） | 正文要写 `\@preview` 或换个说法 |
 | 取包卡住好几秒没反应 | 下载是**同步阻塞**在排版中间的 | 每次都把取包耗时打印出来（冷取 452 ms / 热取 0.1 ms） |
+| `Button::new(("a", "b"))` 编译不过 | `ElementId` 只接受 `&str` / `(&str, EntityId)` 这类，**不接受** `(&str, &str)` | 用 `&str` 当 id（同一栏里标签本来就唯一） |
+| `.selected(bool)` 找不到方法 | 它在 `gpui_component::Selectable` trait 上，不在 `Button` 上 | 把 `Selectable as _` 导进来 |
+| 目录树点一下又展开又收起 | `Tree` 在外层包了一个 `mouse_down` 自己调 `toggle_expand` | 应用侧的回调里只处理「打开文件」，目录直接 return |
 | 右键示例文档报波浪线 | 我写成了 Markdown 的 `**粗体**`，Typst 是 `*...*` | — |
 
 **通用教训**：多窗口桌面上截图对比不可靠（会被别的窗口挡住/干扰），

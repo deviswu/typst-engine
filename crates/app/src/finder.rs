@@ -6,18 +6,9 @@
 
 use std::path::{Path, PathBuf};
 
-/// 扫描时跳过的目录名。
-const SKIP_DIRS: &[&str] = &[
-    "target",
-    ".git",
-    ".cargo",
-    "node_modules",
-    "dist",
-    "build",
-    "__pycache__",
-    ".venv",
-    "venv",
-];
+// 跳过的目录名统一由 `tree::is_heavy_dir` 提供：
+// 目录树与快速打开用**同一份**规则，不然会出现「树里看不见、Ctrl+P 搜得到」。
+use crate::tree::is_heavy_dir;
 
 /// 最大递归深度。防止符号链接环或异常深的目录把启动卡住。
 const MAX_DEPTH: usize = 12;
@@ -50,7 +41,7 @@ pub fn scan(root: &Path, limit: usize) -> Vec<PathBuf> {
             }
 
             if file_type.is_dir() {
-                if SKIP_DIRS.contains(&name.as_str()) {
+                if is_heavy_dir(&name) {
                     continue;
                 }
                 stack.push((entry.path(), depth + 1));
