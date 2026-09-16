@@ -56,6 +56,15 @@ impl<M> OverlayAccessModel<M> {
     pub fn remove_file(&mut self, path: &Path) -> bool {
         self.shadow.remove(path).is_some()
     }
+
+    /// 清掉全部覆盖。返回原本是否**有**覆盖。
+    pub fn clear_shadow(&mut self) -> bool {
+        if self.shadow.is_empty() {
+            return false;
+        }
+        self.shadow.clear();
+        true
+    }
 }
 
 impl<M: PathAccessModel> PathAccessModel for OverlayAccessModel<M> {

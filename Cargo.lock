@@ -8123,6 +8123,7 @@ dependencies = [
  "gpui-component-assets",
  "gpui_platform",
  "image",
+ "tempfile",
  "typst",
  "typst-engine",
  "typst-layout",

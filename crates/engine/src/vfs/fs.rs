@@ -66,6 +66,13 @@ impl<M: PathAccessModel + Clone> Vfs<M> {
         }
     }
 
+    /// 撤掉全部覆盖（换文档时用）。
+    pub fn clear_shadows(&mut self) {
+        if self.access.clear_shadow() {
+            self.bump();
+        }
+    }
+
     /// 廉价快照：`Bytes` 是 `Arc` 支撑的，这里的克隆只是引用计数。
     pub fn snapshot(&self) -> Self {
         Self {

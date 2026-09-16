@@ -27,3 +27,7 @@ codebook-tree-sitter-typst = "0.12.1"
 # `image::Frame`，版本不同就是两个不同类型，编译不过。
 # 版本号取自 zed workspace 根 Cargo.toml（image = "0.25.1"）。
 image = { version = "0.25.1", default-features = false }
+
+[dev-dependencies]
+# finder 的扫描测试要造临时目录
+tempfile = "3"

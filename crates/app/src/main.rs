@@ -30,6 +30,8 @@ use typst_engine::syntax as lang;
 use typst_engine::world::{EngineWorld, EntryState, embedded_and_system_fonts};
 use typst_layout::PagedDocument;
 
+mod finder;
+
 actions!(
     typst_live,
     [
@@ -40,12 +42,26 @@ actions!(
         RecompileNow,
         FormatDocument,
         ExportPdf,
+        PrevPage,
+        NextPage,
+        FirstPage,
+        LastPage,
+        QuickOpen,
+        QuickPrev,
+        QuickNext,
+        QuickCancel,
     ]
 );
 
 const ZOOM_MIN: f32 = 0.25;
 const ZOOM_MAX: f32 = 4.0;
 const ZOOM_STEP: f32 = 1.25;
+
+/// 扫描候选文件的上限。再多就不适合靠打字找了。
+const MAX_SCAN_FILES: usize = 5000;
+
+/// 快速打开列表里最多显示多少条。
+const MAX_QUICK_MATCHES: usize = 50;
 
 const DEMO_DOC: &str = r#"#set page(width: 15cm, height: auto, margin: 1.8cm)
 #set text(size: 11pt)
@@ -147,8 +163,23 @@ struct Previewer {
     dirty: bool,
     /// 一次性的操作反馈（已保存 / 已格式化 / 导出到哪）。
     message: Option<String>,
+
+    /// 项目根目录。快速打开从这里往下找文件。
+    root: PathBuf,
+    /// 候选文件（相对 root）。每次开快速打开时重扫。
+    files: Vec<PathBuf>,
+    quick_input: Entity<InputState>,
+    /// 当前匹配结果（已排序）。
+    quick_matches: Vec<PathBuf>,
+    quick_selected: usize,
+    quick_visible: bool,
+    _quick_sub: Subscription,
     /// 光栅化产物（GPU 纹理）。每次排版或缩放后重建。
     bitmaps: Vec<Arc<RenderImage>>,
+    /// 预览滚动区的句柄。翻页就是把某一页滚到顶部。
+    scroll: ScrollHandle,
+    /// 当前页（0 起）。翻页与缩放后回锚都靠它。
+    current_page: usize,
     /// 当前纹理共占多少字节。用来把显存开销直接显示给用户。
     texture_bytes: usize,
     /// 上一次已排版的文本。
@@ -197,6 +228,29 @@ impl Previewer {
             }
         });
 
+        // 快速打开的查询框。做成常驻的（不是每次开关都新建）——
+        // 开关只是切一个可见性标志，不涉及 entity 与订阅的生死。
+        let quick_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("文件名或路径片段 · ↑↓ 选择 · Enter 打开 · Esc 取消")
+                .submit_on_enter(true)
+        });
+        let quick_sub =
+            cx.subscribe_in(
+                &quick_input,
+                window,
+                |this, _, event, window, cx| match event {
+                    InputEvent::Change => this.refresh_quick_matches(cx),
+                    InputEvent::PressEnter { .. } => this.confirm_quick(window, cx),
+                    _ => {}
+                },
+            );
+
+        let root = main_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+
         let mut this = Self {
             engine,
             main_path,
@@ -210,7 +264,16 @@ impl Previewer {
             stats: lang::TextStats::default(),
             dirty: false,
             message: None,
+            root,
+            files: Vec::new(),
+            quick_input,
+            quick_matches: Vec::new(),
+            quick_selected: 0,
+            quick_visible: false,
+            _quick_sub: quick_sub,
             bitmaps: Vec::new(),
+            scroll: ScrollHandle::new(),
+            current_page: 0,
             texture_bytes: 0,
             last_text: String::new(),
             status: Status::default(),
@@ -371,6 +434,27 @@ impl Previewer {
         cx.notify();
     }
 
+    /// 缩放并把当前页重新锚回预览顶部。
+    fn set_zoom_anchored(&mut self, zoom: f32, cx: &mut Context<Self>) {
+        let before = self.zoom;
+        self.set_zoom(zoom, cx);
+        if (self.zoom - before).abs() > f32::EPSILON {
+            self.scroll.scroll_to_top_of_item(self.current_page);
+        }
+    }
+
+    /// 把第 `page` 页（0 起）滚到预览顶部。越界会被夹到合法范围。
+    fn go_to_page(&mut self, page: usize, cx: &mut Context<Self>) {
+        if self.bitmaps.is_empty() {
+            return;
+        }
+        let page = page.min(self.bitmaps.len() - 1);
+        self.current_page = page;
+        self.scroll.scroll_to_top_of_item(page);
+        self.message = Some(format!("第 {} / {} 页", page + 1, self.bitmaps.len()));
+        cx.notify();
+    }
+
     /// Ctrl+S：把编辑器里的文本写到 `main_path`。
     fn save_file(&mut self, cx: &mut Context<Self>) {
         let text = self.editor.read(cx).value().to_string();
@@ -451,6 +535,104 @@ impl Previewer {
             state.set_cursor_position(Position::new(line as u32, 0), window, cx);
         });
         self.message = Some(format!("已跳到第 {} 行", line + 1));
+        cx.notify();
+    }
+
+    // ── 快速跳转（Ctrl+P）────────────────────────────────────────────
+
+    /// Ctrl+P：扫描项目目录并弹出快速打开。
+    fn show_quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 每次重扫：文件是会被外部增删的，缓一份可能会看不到新建的文件。
+        self.files = finder::scan(&self.root, MAX_SCAN_FILES);
+        self.quick_visible = true;
+        self.message = None;
+
+        self.quick_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            state.focus(window, cx);
+        });
+        // 空 query → 列全部（已排序），所以这里不用再调 refresh
+        self.quick_matches = self.files.iter().take(MAX_QUICK_MATCHES).cloned().collect();
+        self.quick_selected = 0;
+        cx.notify();
+    }
+
+    /// 查询变化 → 重新排序。
+    fn refresh_quick_matches(&mut self, cx: &mut Context<Self>) {
+        if !self.quick_visible {
+            return;
+        }
+        let query = self.quick_input.read(cx).value().trim().to_string();
+
+        self.quick_matches = if query.is_empty() {
+            self.files.iter().take(MAX_QUICK_MATCHES).cloned().collect()
+        } else {
+            finder::rank(&query, &self.files, MAX_QUICK_MATCHES)
+        };
+        self.quick_selected = 0;
+        cx.notify();
+    }
+
+    /// ↑↓：在候选里移动。到头就停住，不循环 —— 循环会让人分不清首尾。
+    fn quick_move(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.quick_matches.is_empty() {
+            return;
+        }
+        let last = self.quick_matches.len() - 1;
+        let next = self.quick_selected as isize + delta;
+        self.quick_selected = next.clamp(0, last as isize) as usize;
+        cx.notify();
+    }
+
+    /// Enter：打开选中的文件。
+    fn confirm_quick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(rel) = self.quick_matches.get(self.quick_selected).cloned() else {
+            self.cancel_quick(cx);
+            return;
+        };
+        let full = self.root.join(&rel);
+
+        let text = match std::fs::read_to_string(&full) {
+            Ok(t) => t,
+            Err(err) => {
+                self.message = Some(format!("读不了 {}：{err}", full.display()));
+                cx.notify();
+                return;
+            }
+        };
+
+        if full == self.main_path {
+            self.cancel_quick(cx);
+            return;
+        }
+
+        // 换文档：字体留着，入口 / 覆盖层 / 源缓存 / 上次成功结果都重置。
+        self.engine.reopen(&self.root, &full);
+        self.main_path = full;
+        self.doc = None;
+        self.bitmaps.clear();
+        self.texture_bytes = 0;
+        self.current_page = 0;
+        self.dirty = false;
+        // 置空是为了让下面的 recompile 不受「文本没变就不排」的干扰
+        self.last_text = String::new();
+
+        self.quick_visible = false;
+        let label = rel.to_string_lossy().replace('\\', "/");
+        self.message = Some(format!("打开 {label}"));
+
+        self.editor.update(cx, |state, cx| {
+            state.set_value(text, window, cx);
+            state.focus(window, cx);
+        });
+        self.recompile(cx);
+    }
+
+    /// Esc / 点空白：关掉，不动已打开的文件。
+    fn cancel_quick(&mut self, cx: &mut Context<Self>) {
+        self.quick_visible = false;
+        self.quick_matches.clear();
+        self.quick_selected = 0;
         cx.notify();
     }
 
@@ -666,6 +848,100 @@ fn to_texture(page: RasterPage) -> Option<Arc<RenderImage>> {
     Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
 }
 
+/// 快速打开的浮层。
+impl Previewer {
+    fn render_quick_open(&self, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+
+        let rows: Vec<(String, usize)> = self
+            .quick_matches
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.to_string_lossy().replace('\\', "/"), i))
+            .collect();
+        let total = self.quick_matches.len();
+
+        let list = if rows.is_empty() {
+            div()
+                .px_3()
+                .py_5()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child(if self.files.is_empty() {
+                    "目录里没找到文件"
+                } else {
+                    "没有匹配的文件"
+                })
+                .into_any_element()
+        } else {
+            v_flex()
+                .id("quick-list")
+                .max_h(px(420.))
+                .overflow_y_scroll()
+                .children(rows.into_iter().map(|(label, i)| {
+                    let selected = i == self.quick_selected;
+                    let mut row = div().px_3().py_1().text_sm().cursor_pointer();
+                    if selected {
+                        row = row.bg(theme.accent.opacity(0.22));
+                    }
+                    row.hover(|s| s.bg(theme.accent.opacity(0.12)))
+                        .child(label)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                this.quick_selected = i;
+                                this.confirm_quick(window, cx);
+                            }),
+                        )
+                }))
+                .into_any_element()
+        };
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .justify_center()
+            .items_start()
+            .pt(px(90.))
+            .bg(gpui::black().opacity(0.25))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| this.cancel_quick(cx)),
+            )
+            .child(
+                v_flex()
+                    // 让 ↑↓ / Esc 的绑定只在这个子树里生效 ——
+                    // 否则会跟编辑器自己的方向键打架。
+                    .key_context("QuickOpen")
+                    .w(px(640.))
+                    .max_h(px(540.))
+                    .bg(theme.background)
+                    .border_1()
+                    .border_color(theme.border)
+                    .rounded_md()
+                    .shadow_lg()
+                    .overflow_hidden()
+                    // 浮层内部的点击不该冒泡到外层的「点空白关闭」
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(Input::new(&self.quick_input).w_full())
+                    .child(
+                        div()
+                            .px_3()
+                            .py_1()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .border_t_1()
+                            .border_color(theme.border)
+                            .child(format!("{} / {} 个文件匹配", total, self.files.len())),
+                    )
+                    .child(list),
+            )
+    }
+}
+
 impl Render for Previewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 窗口可能被拖到另一块缩放不同的显示器上。
@@ -699,6 +975,7 @@ impl Render for Previewer {
             .flex_1()
             .h_full()
             .overflow_scroll()
+            .track_scroll(&self.scroll)
             .bg(theme.secondary)
             .gap_5()
             .py_5()
@@ -740,6 +1017,8 @@ impl Render for Previewer {
                     .child(editor_pane)
                     .child(preview_pane),
             )
+            // 浮层放在最后，才能盖在内容之上
+            .children(self.quick_visible.then(|| self.render_quick_open(cx)))
             .on_action(cx.listener(|this, _: &ZoomIn, _window, cx| {
                 let next = this.zoom * ZOOM_STEP;
                 this.set_zoom(next, cx);
@@ -762,6 +1041,53 @@ impl Render for Previewer {
             }))
             .on_action(cx.listener(|this, _: &ExportPdf, _window, cx| {
                 this.export_pdf(cx);
+            }))
+            .on_action(cx.listener(|this, _: &NextPage, _window, cx| {
+                this.go_to_page(this.current_page + 1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PrevPage, _window, cx| {
+                let prev = this.current_page.saturating_sub(1);
+                this.go_to_page(prev, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FirstPage, _window, cx| {
+                this.go_to_page(0, cx);
+            }))
+            .on_action(cx.listener(|this, _: &LastPage, _window, cx| {
+                let last = this.bitmaps.len().saturating_sub(1);
+                this.go_to_page(last, cx);
+            }))
+            .on_action(cx.listener(|this, _: &QuickOpen, window, cx| {
+                this.show_quick_open(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &QuickPrev, _window, cx| {
+                this.quick_move(-1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &QuickNext, _window, cx| {
+                this.quick_move(1, cx);
+            }))
+            .on_action(cx.listener(|this, _: &QuickCancel, _window, cx| {
+                this.cancel_quick(cx);
+            }))
+            // Ctrl + 滚轮缩放。不阻止容器自身的滚动（gpui 没有 preventDefault），
+            // 所以缩完之后把当前页重新锚回顶部 —— 一举两得：既抵消了误滚，
+            // 又让“缩放不跳位置”成为确定行为。
+            .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _window, cx| {
+                if !ev.modifiers.control {
+                    return;
+                }
+                let dy = match ev.delta {
+                    ScrollDelta::Lines(p) => p.y,
+                    ScrollDelta::Pixels(p) => p.y.as_f32() / 40.0,
+                };
+                if dy == 0.0 {
+                    return;
+                }
+                let next = if dy > 0.0 {
+                    this.zoom * ZOOM_STEP
+                } else {
+                    this.zoom / ZOOM_STEP
+                };
+                this.set_zoom_anchored(next, cx);
             }))
     }
 }
@@ -806,6 +1132,16 @@ fn main() {
             KeyBinding::new("ctrl-b", RecompileNow, None),
             KeyBinding::new("ctrl-shift-f", FormatDocument, None),
             KeyBinding::new("ctrl-e", ExportPdf, None),
+            KeyBinding::new("pageup", PrevPage, None),
+            KeyBinding::new("pagedown", NextPage, None),
+            KeyBinding::new("ctrl-home", FirstPage, None),
+            KeyBinding::new("ctrl-end", LastPage, None),
+            // 快速打开。↑↓ / Esc 必须限定在浮层的按键上下文里，
+            // 否则会抢走编辑器里的方向键。
+            KeyBinding::new("ctrl-p", QuickOpen, None),
+            KeyBinding::new("up", QuickPrev, Some("QuickOpen")),
+            KeyBinding::new("down", QuickNext, Some("QuickOpen")),
+            KeyBinding::new("escape", QuickCancel, Some("QuickOpen")),
         ]);
 
         let (source, path) = load_document(path_arg);

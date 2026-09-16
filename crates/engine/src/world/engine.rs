@@ -1,5 +1,6 @@
 //! `typst::World` 实现。
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -105,6 +106,18 @@ impl EngineWorld {
                 elapsed,
             },
         }
+    }
+
+    /// 换一个文档打开。
+    ///
+    /// **保留字体** —— 扫系统字体要 60 多毫秒，不该为了换个文件重做一遍。
+    /// 重置的是：入口、VFS 覆盖层（上篇文档的未保存编辑不该带到新文件上）、
+    /// 源文件缓存、以及上一次成功的排版结果。
+    pub fn reopen(&mut self, root: impl Into<PathBuf>, main: impl AsRef<Path>) {
+        self.entry = EntryState::new(root, main);
+        self.vfs.clear_shadows();
+        self.sources.invalidate_all();
+        self.success_doc = None;
     }
 
     /// 上一次成功排版的文档。
