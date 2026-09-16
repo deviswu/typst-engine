@@ -15,6 +15,10 @@ typst-syntax = "0.15.1"
 typst-layout = "0.15.1"
 typst-svg = "0.15.1"
 typst-render = "0.15.1"
+typst-pdf = "0.15.1"
+# 进程内格式化。对比 `wu`：它调用外部 typstyle 可执行文件，
+# 用户得先 cargo install typstyle；我们直接链库，无子进程、无安装前置。
+typstyle-core = { version = "0.15.1", default-features = false }
 typst-kit = { version = "0.15.1", features = [
     "scan-fonts",     # 扫系统字体
     "embedded-fonts", # typst 自带的内嵌字体（不含它，缺字体就编译不出东西）

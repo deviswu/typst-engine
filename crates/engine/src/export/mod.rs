@@ -7,8 +7,10 @@
 //! 完整的导出计算图（`Computable` + `TypeId` 缓存 + 页级增量 + 不可见页
 //! 卸载纹理）属于 Plan 2 的 A5–A7。
 
+mod pdf;
 mod pixmap;
 mod svg;
 
+pub use pdf::*;
 pub use pixmap::*;
 pub use svg::*;

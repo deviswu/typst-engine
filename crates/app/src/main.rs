@@ -25,12 +25,23 @@ use gpui_component::{ActiveTheme as _, Root, h_flex, v_flex};
 
 use typst::diag::SourceDiagnostic;
 use typst::foundations::Bytes;
-use typst_engine::export::{RasterPage, pixel_per_pt_for_zoom, rasterize};
+use typst_engine::export::{RasterPage, pdf as export_pdf, pixel_per_pt_for_zoom, rasterize};
 use typst_engine::syntax as lang;
 use typst_engine::world::{EngineWorld, EntryState, embedded_and_system_fonts};
 use typst_layout::PagedDocument;
 
-actions!(typst_live, [ZoomIn, ZoomOut, ZoomReset]);
+actions!(
+    typst_live,
+    [
+        ZoomIn,
+        ZoomOut,
+        ZoomReset,
+        SaveFile,
+        RecompileNow,
+        FormatDocument,
+        ExportPdf,
+    ]
+);
 
 const ZOOM_MIN: f32 = 0.25;
 const ZOOM_MAX: f32 = 4.0;
@@ -122,6 +133,12 @@ struct Previewer {
     compile_errors: Vec<SourceDiagnostic>,
     /// 语法错误 + 编译错误里「错误」的条数。
     error_count: usize,
+    /// 文本规模（字/词/行）。
+    stats: lang::TextStats,
+    /// 自上次保存以来改过没有。
+    dirty: bool,
+    /// 一次性的操作反馈（已保存 / 已格式化 / 导出到哪）。
+    message: Option<String>,
     /// 光栅化产物（GPU 纹理）。每次排版或缩放后重建。
     bitmaps: Vec<Arc<RenderImage>>,
     /// 当前纹理共占多少字节。用来把显存开销直接显示给用户。
@@ -181,12 +198,20 @@ impl Previewer {
             outline: Vec::new(),
             compile_errors: Vec::new(),
             error_count: 0,
+            stats: lang::TextStats::default(),
+            dirty: false,
+            message: None,
             bitmaps: Vec::new(),
             texture_bytes: 0,
             last_text: String::new(),
             status: Status::default(),
             _sub: sub,
         };
+        // 启动就把焦点给编辑器：否则用户打不了字，
+        // 而且 gpui 的动作派发**从聚焦节点开始**，没有焦点时
+        // Ctrl+S 之类的全局快捷键根本不会触达 on_action。
+        this.editor.update(cx, |state, cx| state.focus(window, cx));
+
         // 首次编译不走守卫：文本为空也该先把世界建起来。
         this.recompile(cx);
         this
@@ -198,6 +223,7 @@ impl Previewer {
         if text == self.last_text {
             return;
         }
+        self.dirty = true;
         self.recompile(cx);
     }
 
@@ -263,6 +289,7 @@ impl Previewer {
         };
 
         self.outline = lang::outline(&source);
+        self.stats = lang::text_stats(source.text());
 
         // 语法错误（不编译就有）与编译错误**形状相同**，所以
         // 交给同一个渲染器，不需要区分来源。
@@ -334,10 +361,93 @@ impl Previewer {
         cx.notify();
     }
 
+    /// Ctrl+S：把编辑器里的文本写到 `main_path`。
+    fn save_file(&mut self, cx: &mut Context<Self>) {
+        let text = self.editor.read(cx).value().to_string();
+
+        match std::fs::write(&self.main_path, &text) {
+            Ok(()) => {
+                // 磁盘与内存一致了，撤掉覆盖层 —— 从此磁盘就是真相。
+                // （主文件的文本还在 SourceDb 里，所以不会因此重新解析。）
+                self.engine.vfs_mut().unmap_shadow(&self.main_path);
+                self.dirty = false;
+                self.message = Some(format!("已保存 {}", self.main_path.display()));
+            }
+            Err(err) => self.message = Some(format!("保存失败：{err}")),
+        }
+        cx.notify();
+    }
+
+    /// Ctrl+B：手动重新编译。
+    ///
+    /// 不只是「再排一次」—— 它先把源文件缓存**全部作废**，
+    /// 这样被 `#include` 的文件如果被外部改过也能重新读进来
+    /// （我们没有文件监听，所以这是手动补上那个缺口）。
+    /// 主文件的未保存编辑不会丢：它的文本同时存在于 VFS 覆盖层里。
+    fn recompile_now(&mut self, cx: &mut Context<Self>) {
+        self.engine.sources().invalidate_all();
+        self.message = Some("已重新编译（源文件缓存已作废）".to_owned());
+        self.recompile(cx);
+    }
+
+    /// Ctrl+Shift+F：进程内格式化。
+    fn format_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.editor.read(cx).value().to_string();
+
+        match typst_engine::format::format(&text) {
+            Ok(formatted) if formatted == text => {
+                self.message = Some("已经是格式化状态".to_owned());
+            }
+            Ok(formatted) => {
+                // `set_value` 刻意不发 Change 事件（`emit_events = false`），
+                // 所以得自己触发一次重排。
+                self.editor
+                    .update(cx, |state, cx| state.set_value(formatted, window, cx));
+                self.dirty = true;
+                self.message = Some("已格式化".to_owned());
+                self.recompile(cx);
+            }
+            Err(err) => {
+                self.message = Some(format!("格式化失败（语法可能不完整）：{err}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Ctrl+E：导出 PDF。
+    ///
+    /// 手上已经有 `PagedDocument`，所以不重新排版、不重读文件、不起子进程。
+    fn export_pdf(&mut self, cx: &mut Context<Self>) {
+        let Some(doc) = self.doc.clone() else {
+            self.message = Some("还没有可导出的排版结果".to_owned());
+            cx.notify();
+            return;
+        };
+
+        let out = self.main_path.with_extension("pdf");
+        self.message = Some(match export_pdf(&doc) {
+            Ok(bytes) => match std::fs::write(&out, bytes) {
+                Ok(()) => format!("已导出 {}", out.display()),
+                Err(err) => format!("写 PDF 失败：{err}"),
+            },
+            Err(errors) => format!("导出失败：{} 条诊断", errors.len()),
+        });
+        cx.notify();
+    }
+
+    /// 大纲点击：把光标移到那一行。
+    fn jump_to_line(&mut self, line: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.update(cx, |state, cx| {
+            state.set_cursor_position(Position::new(line as u32, 0), window, cx);
+        });
+        self.message = Some(format!("已跳到第 {} 行", line + 1));
+        cx.notify();
+    }
+
     fn render_statusbar(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
 
-        let mut bar = h_flex()
+        let bar = h_flex()
             .w_full()
             .px_3()
             .py_1p5()
@@ -370,17 +480,37 @@ impl Previewer {
                 self.status.compiles, self.status.rasters
             ));
 
-        bar = bar.child(format!("{} 个标题", self.outline.len()));
+        // 第二行：文档信息 + 保存状态 + 一次性反馈。
+        // 拆两行是因为第一行已被引擎指标占满，再塞就只看得花。
+        let mut info = h_flex()
+            .w_full()
+            .px_3()
+            .py_1()
+            .gap_4()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(self.stats.summary())
+            .child(format!("{} 个标题", self.outline.len()))
+            .child(if self.dirty {
+                "● 未保存"
+            } else {
+                "已保存"
+            });
 
-        if self.error_count == 0 {
-            bar = bar.child(div().text_color(theme.success).child("✓ 无错误"));
-        } else {
-            bar = bar.child(div().text_color(theme.danger).child(format!(
+        if self.error_count > 0 {
+            info = info.child(div().text_color(theme.danger).child(format!(
                 "✗ {} 个错误（预览保留上次成功结果）",
                 self.error_count
             )));
+        } else {
+            info = info.child(div().text_color(theme.success).child("✓ 无错误"));
         }
-        bar
+
+        if let Some(msg) = &self.message {
+            info = info.child(div().text_color(theme.primary).child(msg.clone()));
+        }
+
+        v_flex().w_full().child(bar).child(info)
     }
 
     /// 左侧大纲栏。
@@ -403,23 +533,37 @@ impl Previewer {
                         .into_any_element(),
                 ]
             } else {
-                self.outline
+                // 先收成自有数据再建元素：避免在闭包里借用 `self.outline`。
+                let rows: Vec<(usize, String, usize)> = self
+                    .outline
                     .iter()
-                    .map(|item| {
+                    .map(|i| (i.depth, i.title.clone(), i.line))
+                    .collect();
+
+                rows.into_iter()
+                    .map(|(depth, title, line)| {
                         div()
                             .px_3()
                             .py_0p5()
                             .text_xs()
-                            .text_color(if item.depth == 1 {
+                            .cursor_pointer()
+                            .text_color(if depth == 1 {
                                 theme.foreground
                             } else {
                                 theme.muted_foreground
                             })
+                            .hover(|s| s.bg(theme.accent.opacity(0.12)))
                             .child(format!(
                                 "{}{}",
-                                "    ".repeat(item.depth.saturating_sub(1)),
-                                item.title
+                                "    ".repeat(depth.saturating_sub(1)),
+                                title
                             ))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                    this.jump_to_line(line, window, cx);
+                                }),
+                            )
                             .into_any_element()
                     })
                     .collect()
@@ -581,6 +725,18 @@ impl Render for Previewer {
             .on_action(cx.listener(|this, _: &ZoomReset, _window, cx| {
                 this.set_zoom(1.0, cx);
             }))
+            .on_action(cx.listener(|this, _: &SaveFile, _window, cx| {
+                this.save_file(cx);
+            }))
+            .on_action(cx.listener(|this, _: &RecompileNow, _window, cx| {
+                this.recompile_now(cx);
+            }))
+            .on_action(cx.listener(|this, _: &FormatDocument, window, cx| {
+                this.format_document(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ExportPdf, _window, cx| {
+                this.export_pdf(cx);
+            }))
     }
 }
 
@@ -617,8 +773,13 @@ fn main() {
 
         cx.bind_keys([
             KeyBinding::new("ctrl-=", ZoomIn, None),
+            KeyBinding::new("ctrl-+", ZoomIn, None),
             KeyBinding::new("ctrl--", ZoomOut, None),
             KeyBinding::new("ctrl-0", ZoomReset, None),
+            KeyBinding::new("ctrl-s", SaveFile, None),
+            KeyBinding::new("ctrl-b", RecompileNow, None),
+            KeyBinding::new("ctrl-shift-f", FormatDocument, None),
+            KeyBinding::new("ctrl-e", ExportPdf, None),
         ]);
 
         let (source, path) = load_document(path_arg);

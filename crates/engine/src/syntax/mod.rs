@@ -33,6 +33,8 @@
 
 mod diagnostic;
 mod outline;
+mod stats;
 
 pub use diagnostic::*;
 pub use outline::*;
+pub use stats::*;

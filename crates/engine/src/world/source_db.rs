@@ -118,6 +118,17 @@ impl SourceDb {
         slot.source.peek().map(|s| s.text().to_owned())
     }
 
+    /// 作废全部文件的缓存。
+    ///
+    /// 用于「手动重新编译」：磁盘上的**被 include 的文件**可能被外部改过，
+    /// 而我们没有文件监听。作废后重编就会重新读磁盘。
+    ///
+    /// 主文件的内存编辑不会因此丢失 —— 它的文本同时存在于 VFS 覆盖层里，
+    /// 重新读到的还是编辑器里的那份。
+    pub fn invalidate_all(&self) {
+        self.slots.lock().clear();
+    }
+
     /// `Source::new` 被调用了几次。
     pub fn construct_count(&self) -> usize {
         self.constructs.load(Ordering::Relaxed)
