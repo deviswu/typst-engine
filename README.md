@@ -10,8 +10,14 @@ Typst 的**实时增量编译引擎** —— 一个 UI 无关的 Rust 库。
 
 ## 状态
 
-**设计阶段（spec 已写，实现未开始）**。设计文档见
-[`docs/superpowers/specs/2026-09-16-typst-engine-design.md`](docs/superpowers/specs/2026-09-16-typst-engine-design.md)。
+**计划阶段（设计 + Plan 1 已写，实现未开始）**。
+
+| 文档 | 内容 |
+|---|---|
+| [设计文档](docs/superpowers/specs/2026-09-16-typst-engine-design.md) | 架构、组件接口、数据流、错误处理、验收指标、待实测风险 |
+| [Plan 1 实施计划](docs/superpowers/plans/2026-09-16-plan-1-vfs-and-world.md) | L0 VFS + L1 World，10 个 TDD 任务 |
+
+后续计划：Plan 2（L2 驱动 + L3 导出，即「实时」的闭环）、Plan 3（L4 语法服务）。
 
 设计依据来自对 [tinymist](https://github.com/Myriad-Dreamin/tinymist) 编译链的源码级拆解 —— 采用了它的
 **overlay VFS + revision 失效 + comemo 记忆化 + 快照保留上次成功结果** 这几条核心思路，
@@ -32,11 +38,6 @@ typst-engine/                      Cargo workspace
 （GPUI 外壳不在本仓库 —— 引擎先独立跑通并达标，再接 UI。）
 
 ## 文档
-
-| 文档 | 内容 |
-|---|---|
-| [设计文档](docs/superpowers/specs/2026-09-16-typst-engine-design.md) | 架构、组件接口、数据流、错误处理、验收指标、待实测风险 |
-
 ## 许可
 
 待定。

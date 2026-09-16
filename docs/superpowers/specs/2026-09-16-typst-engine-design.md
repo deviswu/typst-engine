@@ -109,7 +109,7 @@ type VfsAccessModel<M> =
 | `CompileSnapshot.success_doc` | 编译失败保留上次成功的文档 → 不白屏 | `snapshot.rs:105` |
 | `CompileSignal` + `TaskWhen` | 「这次该不该编译」的策略引擎 | `snapshot.rs:36`、`TaskWhen::{Never,Script,OnType,OnSave,..}` |
 | `WorldComputeGraph`（`TypeId` → `OnceLock` 缓存） | 导出任务只算一次，快照间复用 | `world/compute.rs` |
-| `rpds::RedBlackTreeMapSync` | 持久化不可变 map → 快照能带上整份缓存 | `compute.rs:37` |
+| ~~`rpds::RedBlackTreeMapSync`~~ | tinymist 用它做持久化 map，好让快照带上整份缓存 | `compute.rs:37` 　**→ 本项目不采用，见下** |
 | `SourceDb` + `QueryRef<Source>` | 未变文件的 `Source` 跨 revision 复用 → comemo 命中前提 | `world/source.rs` |
 | actor + `Interrupt` 队列 | 单人串行化所有变更，杜绝并发编译 | `project/compiler.rs` |
 | 增量 SVG diff（`"diff-v1 frame"`） | 预览不重传整页 | `typst-preview/src/actor/render.rs:152` |
@@ -150,7 +150,7 @@ type VfsAccessModel<M> =
 │                          L0  Overlay VFS ★                 │
 │   内存覆盖 · 路径解析 · notify 事件 · revision              │
 │   依赖：typst · typst-layout/render/svg/pdf · typst-kit     │
-│          comemo · rpds · notify · tokio · parking_lot      │
+│          comemo · typst-kit · notify · tokio · parking_lot │
 └───────────────────────────────────────────────────────────┘
 ```
 
@@ -249,7 +249,7 @@ pub trait PathAccessModel: Send + Sync {
 | `InMemoryAccessModel` | `HashMap<ImmutPath, Bytes>` | 兼作**测试底座**（替代 tinymist 的 `dummy` + `mock` 两层） |
 | `SystemAccessModel` | 读磁盘 | 读失败映射成 `FileError::{NotFound, Io}` |
 | `NotifyAccessModel` | 记录 notify 8 事件 | 保存「哪些路径被外部改过」；底层 `notify = "8"` |
-| `OverlayAccessModel<M>` | **内存覆盖磁盘** ★ | `RedBlackTreeMapSync<ImmutPath, FileSnapshot>` 覆盖层 + `inner: M` |
+| `OverlayAccessModel<M>` | **内存覆盖磁盘** ★ | `HashMap<ImmutPath, FileSnapshot>` 覆盖层 + `inner: M` |
 | `ResolveAccessModel<M>` | `FileId` → 路径解析 | 强制 root 边界，禁止越界读 |
 
 #### 组合
@@ -267,6 +267,19 @@ pub type VfsAccessModel<M> =
 - 去掉按 `FileId` 索引的 overlay —— 单入口文档模型下，**按路径覆盖就够了**
 
 **7 层 → 4 层。**
+
+#### 为什么不用 `rpds`（偏离 tinymist 的第二处）
+
+tinymist 用 `rpds::RedBlackTreeMapSync`（持久化不可变 map）做 overlay 和 compute graph，
+目的是让 `snapshot()` 变成 O(1) 的结构共享。本项目**不引入 `rpds`**，用普通 `HashMap`，原因：
+
+1. **值是 Arc 支撑的，普通克隆已经够便宜** —— `typst::foundations::Bytes` 的实际定义是
+   `pub struct Bytes(Arc<LazyHash<dyn Bytelike>>)`（`typst-library-0.15.1/src/foundations/bytes.rs:46`），
+   克隆只走一个 `Arc` 引用计数。克隆一个 `HashMap<Path, FileSnapshot>` = N 次原子加。
+2. **N 很小** —— overlay 里只装「编辑器当前打开的文件」，量级是个位数到几十。
+3. **单写者** —— 没有 tinymist 那种高并发下结构共享的收益。
+
+少一个依赖、少一层间接。若将来 profile 显示快照真是瓶颈，再换成 `rpds`（接口不变）。
 
 #### `Vfs` 与 revision
 
@@ -354,11 +367,45 @@ struct SourceSlot {
 pub struct QueryRef<T, E>(Arc<OnceLock<Result<T, E>>>);
 ```
 
-**核心不变式（整个「增量」的地基）**：
+**两条不变式（整个「增量」的地基）**
 
-> 文件内容未变 ⇒ `source(id)` 必须返回**同一个** `Source`（同一 `Arc`），而不是内容相同的新对象。
+先纠正一个容易搞错的点 —— 查了 `typst-syntax-0.15.1/src/source.rs:22-24` 与 `typst-utils` 的 `LazyHash`：
 
-因为 `Source` 是 comemo 记忆化键的一部分，**指针不同 = 缓存全失效**。这条不变式直接决定性能，也直接决定它必须被测试（见 §7）。
+```rust
+/// Values of this type are cheap to clone and hash.
+#[derive(Clone, Hash)]
+pub struct Source(Arc<LazyHash<SourceInner>>);
+```
+
+`Source` **不按指针比较** —— `Hash` 是派生的，落到 `LazyHash<SourceInner>`（哈希值计算一次后缓存）。
+所以「内容相同的两个 `Source`」在 comemo 眼里是**相等**的，缓存**仍会命中**。
+这比我最初想的更健壮，但也意味着真正的成本不在 comemo，而在 **`Source::new` 里的 `parse` + `numberize`**。
+
+于是两条不变式各管一件事：
+
+> **I1（省 comemo 重算）**：文件内容未变 ⇒ 不重新造 `Source`。
+> 目的不是保 comemo 命中，而是**省掉一次全量 parse**。
+>
+> **I2（省 parse）**：被编辑的文件 ⇒ 用 `Source::replace` **原地增量重解析**，不调 `Source::new`。
+
+I2 是官方指定的做法 —— `typst-library-0.15.1/src/lib.rs:47-55` 的原话：
+
+> All loading functions (`main`, `source`, `file`, `font`) should perform **internal caching** so that they are
+> relatively cheap on repeated invocations with the same argument. … **Advanced clients like language servers
+> can also retain the source files and `edit` them in-place to benefit from better incremental performance.**
+
+对应的两个 API（`source.rs:85` 与 `:104`）：
+
+```rust
+pub fn replace(&mut self, new: &str) -> Range<usize>;                        // 按公共前后缀找最小改动
+pub fn edit(&mut self, replace: Range<usize>, with: &str) -> Range<usize>;   // 增量 reparse
+```
+
+两者都**返回「实际重解析的范围」** —— 这就是度量增量有效性的直接指标（见 §8 的 A9），
+不需要猜、不需要破坏性实验。内部用 `Arc::make_mut`：我们独占时就地改，没有重新分配。
+
+**→ 这改变了 `SourceDb` 的定位**：它不只是「带记忆化的缓存」，而是**一棵持续增量维护的语法树**。
+被编辑的文件在 `SourceDb` 里**持有可变的 `Source`**，`feed_memory` 时调 `replace` 而不是重建。
 
 #### EntryState
 
@@ -375,7 +422,11 @@ pub struct EntryState {
 #### 字体与包
 
 - 字体：`typst-kit` 的 `FontStore`（embedded + `scan-fonts` 扫系统）。与 `jicheng` 现在的做法一致，已验证可用。
-- 包：用 `typst-kit` 的包注册表能力。**⚠️ 待确认** —— 见 §9 风险 R4。若 `typst-kit 0.15.1` 的包解析 API 不便使用，v1 降级为「只支持本地相对路径 `#import`」，`@preview` 留到 v2。
+- 包：直接用 `typst-kit`，**R4 已实测解除**（见 §9）。`typst-kit 0.15.1` 提供 `packages::SystemPackages`，
+  文档原语是 "Serves packages from standard locations … loads packages from the same sources as the CLI"（数据目录 →
+  缓存目录 → 从 Typst Universe 下载）。需要 features `["system-packages", "universe-packages"]`，
+  下载器用 `downloader::SystemDownloader`（feature `system-downloader`）。
+  `VirtualRoot::Package(PackageSpec)` → `SystemPackages::obtain(&spec)` → `FsRoot` → 拼 `vpath`。
 
 ### 5.3 L2 · 编译驱动
 
@@ -475,7 +526,7 @@ pub struct Debounce {
 ```rust
 pub struct ComputeGraph {
     snap: CompileSnapshot,
-    entries: Mutex<RedBlackTreeMapSync<TypeId, Entry>>,
+    entries: Mutex<HashMap<TypeId, Entry>>,
 }
 
 pub trait Computable: Any + Send + Sync + Sized {
@@ -615,15 +666,29 @@ pub fn syntax_diagnostics(source: &Source) -> Vec<SyntaxDiag>;
 
 ### 7.2 L1 World —— 最关键的一条
 
+测的是**「有没有白做工作」**，不是「结果对不对」。两个方向：
+
+**① 未变的文件不重新 parse**（I1）
+
 ```rust
-// 改 A 文件后：
-//   source(a_id) 必须是**新**的 Arc
-//   source(b_id) 必须是与上一轮**同一个** Arc          ← 增量生效的证明
+// 改 A 后：B 的 Source 必须还是同一个 Arc（根本没碰过）
 assert!(Arc::ptr_eq(&before_b, &after_b));
-assert!(!Arc::ptr_eq(&before_a, &after_a));
 ```
 
-用 `Arc::ptr_eq` 断言缓存复用，而不是比较内容相等 —— **内容相等证明不了递增有效**。这是本项目最重要的一条测试。
+用 `Arc::ptr_eq` 而不是比较内容相等 —— 内容相等只能说明结果一样，**证明不了没白干活**。
+同时用一个 `AtomicUsize` 计数 `Source::new` 的调用次数，断言编辑 A 后它**没增加**。
+
+**② 被编辑的文件是增量重解析**（I2）—— 这条比 ① 更重要
+
+```rust
+// Source::replace 直接返回实际重解析的字节范围
+let reparsed = db.feed_memory(path, &new_text);
+// 在一个 3000 行文档的中间插入 1 个字符：
+assert!(reparsed.len() < text.len() / 10, "重解析了 {reparsed:?}，退化成了全量");
+```
+
+`Source::replace` 的返回值让「增量是否真的生效」变成一个**可直接断言的数字**，
+而不是靠跑分推测。这是本项目最重要的一条测试。
 
 ### 7.3 L2 Driver
 
@@ -661,7 +726,8 @@ assert!(!Arc::ptr_eq(&before_a, &after_a));
 
 | # | 指标 | 测量方法 | 目标 |
 |---|---|---|---|
-| A1 | 增量**真的**生效 | §7.2 的 `Arc::ptr_eq` 断言 | 未变文件缓存命中率 = 100% |
+| A1 | 未变文件不重新 parse | §7.2 ① 的 `Arc::ptr_eq` + `Source::new` 调用计数 | 编辑 A 后计数不增 |
+| A9 | **增量重解析真的增量** | `Source::replace` 返回的重解析范围长度 | 3000 行文档插入 1 字符，重解析范围 < 全文 10% |
 | A2 | 导出不重算 | §7.4 的调用计数器 | 同 revision 计算次数 = 1 |
 | A3 | on-type 延迟 | 3000 行文档，连续输入停止 → 预览更新，取 P95 | **先测基线再定**（初始目标 < 250ms） |
 | A4 | 增量加速比 | 改 1 页 1 个词 vs 全量编译的耗时比 | **先测基线再定**（初始目标 < 40%） |
@@ -676,18 +742,54 @@ assert!(!Arc::ptr_eq(&before_a, &after_a));
 
 ## 9. 待实测风险
 
-**R1 · `typst-syntax` 全量 parse 是否够快**（影响 A5，进而影响「每键高亮」是否可行）
-tinymist 的做法说明够快，但没在本机实测。若 3000 行超一帧预算 → 降级为「按可视区域增量解析」或「高亮节流到 ~8ms」。
+**R1 · 解析开销是否够快**（影响 A5，进而影响「每键高亮」是否可行）
+
+**风险面比初稿估计的小** —— typst 自带增量 reparse（`Source::replace` / `edit`，见 §5.2），
+所以「全量 parse」只发生在每个文件的**首次**读取，后续编辑走增量。
+
+但仍有两个待实测项：
+
+1. `Source::replace` 重解析范围的实际大小与耗时（直接读返回值，见 A9）。
+2. **`Arc::make_mut` 会不会因为 comemo 持有旧 `Source` 而退化成深克隆** ——
+   comemo 的记忆化键里含 `Source`，会一直持着克隆，使强引用计数 > 1。
+   此时 `make_mut` 会克隆 `SourceInner`：其中 `SyntaxNode` 只是 `Arc` 拨动（便宜），
+   但 `Lines<String>` 是全量 `String` 拷贝，即 O(文本长度)。
+   所以最坏情形是「O(n) 内存拷贝 + 增量 reparse」。**这需要实测定量。**
 
 **R2 · comemo 命中率**（影响 A3/A4）
-comemo 是本进程内的全局缓存。反复编译**同一入口**时命中率如何、`evict` 该给多大阈值，需要实测。若命中率低，增量收益会远小于预期 —— 这是整个方案最大的不确定性。
+
+comemo 是本进程内的全局缓存。反复编译**同一入口**时命中率如何、`evict` 该给多大阈值，需要实测。
+
+> 初稿误判了一件事（已纠正）：`Source` 的 `Hash` 是**内容哈希**（`Arc<LazyHash<SourceInner>>`），
+> 不是指针哈希。所以即使返回内容相同的新 `Source`，comemo **依旧会命中** —— 增量不会因此失效。
+> 真正的风险只剩上面 R1 的 `make_mut` 退化，以及 comemo 缓存无上限增长。
 
 **R3 · typst 编译不可取消**
 `typst::compile` 是同步阻塞且没有取消机制。若某次编译意外变慢（大循环、复杂布局），防抖机制救不了，会卡住整个驱动。
 v1 对策：编译跑在独立线程，驱动不阻塞；**不做**超时中断（typst 不支持安全中断，强杀会污染 comemo 缓存）。
 
-**R4 · `typst-kit 0.15.1` 的包解析 API 形状未知**
-tinymist 自研了 `package/` 模块（说明 `typst-kit` 可能不够用）。若不便使用，v1 降级为「只支持本地相对路径 `#import`」，`@preview` 留 v2。
+**R4 · `typst-kit 0.15.1` 的包解析 API 形状未知** → ✅ **已实测解除**
+
+查了本机 `~/.cargo/registry/.../typst-kit-0.15.1/src/packages.rs`，官方提供了 `SystemPackages`：
+
+```rust
+pub struct SystemPackages { .. }
+impl SystemPackages {
+    pub fn new(downloader: impl Downloader) -> Self;
+    pub fn from_parts(..) -> Self;
+    pub fn obtain(&self, spec: &PackageSpec) -> PackageResult<FsRoot>;
+    pub fn latest_version(..);
+}
+```
+
+按「数据目录 → 缓存目录 → 从 Universe 下载」的顺序解析，与 `typst` CLI 一致。配合
+`downloader::SystemDownloader::new(user_agent)` 即可。**`@preview` 包支持直接进 v1**，不需要降级。
+
+> 实现时注意：网络下载必须放到后台，且首次下载失败要能让编译带着 `FileError::Package` 正常报错，
+> 不能 panic，也不能阻塞 UI 线程。
+
+> 旁注：tinymist 仍然自研了 `crates/tinymist-world/src/package/`，那是因为它要支持多项目与自建 registry。
+> 单入口文档模型用官方 `SystemPackages` 就够。
 
 **R5 · 编译 panic 会否拖垮进程**
 typst 理论上不该 panic，但真实文档 + 复杂包可能触发。对策：驱动层用 `catch_unwind` 包住编译，标记该轮失败并继续服务 —— **但要注意 comemo 内部状态被 panic 污染的可能**，需要实测确认 `catch_unwind` 后下一轮编译仍正常。
