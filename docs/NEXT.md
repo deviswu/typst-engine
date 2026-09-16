@@ -29,8 +29,8 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 | L5 | GPUI 外壳 | ✅ |
 | L6 | 跳转索引（源码字节 ⇄ 页/页内 pt） | ✅ `crates/engine/src/jump.rs` + 外壳双击接入 |
 
-- 21 个 commit，6615 行 Rust（32 个 `.rs` 文件），clippy 与 `cargo fmt` 都干净
-- **本地仓库，无远端** ← 最该先做的事
+- 22 个 commit，6615 行 Rust（32 个 `.rs` 文件），clippy 与 `cargo fmt` 都干净
+- 远端：`github.com/deviswu/typst-engine`（public，`master`，SSH）—— 已推完，`git push` 即可
 - 依赖只有 crates.io 官方 `typst 0.15.1`，无 git fork
 
 性能（3002 行 / 51 KB / 45 页）：增量重解析 0.1 ms，大纲 1.1 ms，
@@ -50,9 +50,11 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 
 ## 下一步（按我的推荐排序）
 
-1. **推 GitHub** —— 19 个 commit 只在本地，这是唯一的「未保存」风险项。
-2. **设置持久化** —— 窗口尺寸/位置、最近文件、当前缩放。小工作量、体感提升大
+1. **设置持久化** —— 窗口尺寸/位置、最近文件、当前缩放。小工作量、体感提升大
    （每次开窗都要重新调大小）。
+2. **把坐标换算抽成纯函数 + 单测** —— `window_to_page_pt` / `page_pt_to_window`
+   目前只被临时自检覆盖过（自检已删）。那个「内容坐标 vs 窗口坐标」的坑
+   只在预览滚过时才现形，锁进 `cargo test` 才能防复发。半小时的活。
 3. **工具栏** —— `wu` 有：标题 / 加粗 / 对齐 / 颜色 / 上下标 / 公式 / 图片 /
    表格 / 分页 一键插入。中等工作量，纯 UI。
 4. **长文档首屏** —— 45 页冷编译 222 ms。可考虑：先出第一页再后台排完，
@@ -60,6 +62,10 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 5. **`@preview` 联网下载** —— 引擎的 `Packages` 目前只认本地包目录。
    要用 `typst-kit::packages::SystemPackages` + `SystemDownloader`（spec §9 R4 已查清）。
 6. **主题切换** —— gpui-component 自带多套主题，接一下就行。
+
+想做的还有（都小）：预览里的链接可点（`FrameItem::Link`，索引里已经在手边）、
+索引改按页惰性建（22 ms → 0.5 ms 级，**只有真感觉到卡顿才做**）、
+双击只跳转不选词（一行 `stop_propagation`）。
 
 ## 已论证「不做」（别重新捡起来）
 
