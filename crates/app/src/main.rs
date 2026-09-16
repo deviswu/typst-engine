@@ -28,6 +28,7 @@ use gpui_component::highlighter::{
 use gpui_component::input::{Input, InputEvent, InputState, Position};
 use gpui_component::list::ListItem;
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_component::resizable::{h_resizable, resizable_panel};
 use gpui_component::select::{Select, SelectEvent, SelectState};
 use gpui_component::tree::{Tree, TreeEvent, TreeState};
 use gpui_component::{
@@ -131,6 +132,9 @@ fn since_start_ms() -> f64 {
 /// 前向跳转时把目标行放在视口顶部往下多少逻辑像素处 ——
 /// 上面留一点，好看见「这是哪一段」。
 const SYNC_MARGIN: f32 = 80.0;
+
+/// 预览里页面两侧留的边距（逻辑像素）。「适应宽度」时页宽 = 展示区宽 - 2×它。
+const PREVIEW_MARGIN: f32 = 24.0;
 
 const DEMO_DOC: &str = r#"#set page(width: 15cm, height: auto, margin: 1.8cm)
 #set text(size: 11pt)
@@ -322,6 +326,9 @@ struct Previewer {
     doc: Option<Arc<PagedDocument>>,
     /// 缩放倍率。1.0 = 屏幕上「实际大小」（96 dpi）。
     zoom: f32,
+    /// 缩放是不是「适应宽度」模式（默认开）：开着时每次渲染按展示区宽度重算，
+    /// 所以拖动分区、改窗口大小页面都会跟着充满。手动缩放会关掉它，Ctrl+0 回来。
+    zoom_fit: bool,
     /// 窗口所在显示器的缩放系数（Windows 的「缩放与布局」，常见 1.0 / 1.25 / 1.5）。
     ///
     /// **必须参与光栅化**：`zoom` 说的是「文档要占多大的逻辑尺寸」，
@@ -608,8 +615,10 @@ impl Previewer {
             main_path,
             editor,
             doc: None,
-            // 上次的缩放从设置里恢复（还要夹一次，手改过的设置可能越界）
+            // 上次的缩放从设置里恢复（还要夹一次，手改过的设置可能越界）；
+            // 但启动时默认仍走「适应宽度」—— 用户要的是「页面始终充满展示区」
             zoom: settings.zoom.unwrap_or(1.0).clamp(ZOOM_MIN, ZOOM_MAX),
+            zoom_fit: true,
             scale_factor: window.scale_factor(),
             outline: Vec::new(),
             compile_errors: Vec::new(),
@@ -854,6 +863,42 @@ impl Previewer {
         self.live_range = None;
     }
 
+    /// 预览「适应宽度」：让页宽 = 展示区宽 - 两侧边距。
+    ///
+    /// 只要开着 `zoom_fit`，每次渲染都按当前展示区宽度重算缩放 —— 所以
+    /// **拖动分区、改窗口大小，页面都会跟着充满**（这正是用户要的）。
+    /// 手动缩放（Ctrl+=/-）会关掉它，Ctrl+0 再回来。
+    ///
+    /// 为什么在 `render` 里做：展示区宽度只有布局完才知道，用上一帧的
+    /// `ScrollHandle::bounds()` 就够了（差一帧，肉眼看不出来）。
+    fn fit_zoom_to_viewport(&mut self) {
+        if !self.zoom_fit {
+            return;
+        }
+        let Some(page) = self.doc.as_ref().and_then(|doc| doc.pages().first()) else {
+            return;
+        };
+        let width = self.scroll.bounds().size.width.as_f32();
+        if width <= 1.0 {
+            return; // 还没布局
+        }
+
+        let page_pt = page.frame.size().x.to_pt() as f32;
+        let usable = (width - PREVIEW_MARGIN * 2.0).max(64.0);
+        let fit = usable / (page_pt * typst_engine::export::BASE_PIXEL_PER_PT);
+
+        // 只在真的变了才重建纹理（拖动时每帧都会算，但相等就不动手）
+        let fit = fit.clamp(ZOOM_MIN, ZOOM_MAX);
+        if (fit - self.zoom).abs() > 0.005 {
+            println!(
+                "[typst-live] 适应宽度：展示区 {width:.0}px - 边距 {:.0}px → 缩放 {fit:.3}（页宽 {page_pt:.1}pt）",
+                PREVIEW_MARGIN * 2.0
+            );
+            self.zoom = fit;
+            self.rerasterize();
+        }
+    }
+
     /// 按当前视口把该出图的页出了，把不该留的丢掉。
     ///
     /// 只在**可见页范围真的变了**的时候动手 —— 滚动过程中每帧都重算
@@ -997,7 +1042,23 @@ impl Previewer {
         cx.notify();
     }
 
+    /// 用户手动缩放（Ctrl+= / Ctrl+- / 滚轮）：退出「适应宽度」。
     fn set_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
+        self.zoom_fit = false;
+        self.touch_settings(cx);
+        self.apply_zoom(zoom, cx);
+    }
+
+    /// 回到「适应宽度」（Ctrl+0）。
+    fn fit_zoom(&mut self, cx: &mut Context<Self>) {
+        self.zoom_fit = true;
+        self.fit_zoom_to_viewport();
+        self.touch_settings(cx);
+        cx.notify();
+    }
+
+    /// 真正改缩放：不动「手动/适应」开关，也不写设置（拖动分区时会频繁触发）。
+    fn apply_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
         let zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
         if (zoom - self.zoom).abs() < f32::EPSILON {
             return;
@@ -2136,9 +2197,9 @@ impl Previewer {
                                     this.set_zoom(next, cx);
                                 }),
                             ))
-                            .item(PopupMenuItem::new("实际大小（Ctrl+0）").on_click(
+                            .item(PopupMenuItem::new("适应宽度（Ctrl+0）").on_click(
                                 window.listener_for(&view, |this, _, _window, cx| {
-                                    this.set_zoom(1.0, cx);
+                                    this.fit_zoom(cx);
                                 }),
                             ))
                     })
@@ -2590,8 +2651,13 @@ impl Previewer {
             })
             .child(
                 div()
+                    .flex_shrink_0()
                     .text_color(theme.primary)
-                    .child(format!("{:.0}%", self.zoom * 100.0)),
+                    .child(if self.zoom_fit {
+                        format!("充满 {:.0}%", self.zoom * 100.0)
+                    } else {
+                        format!("{:.0}%", self.zoom * 100.0)
+                    }),
             )
             .child(format!(
                 "排版{}·光栅{}·索引{}",
@@ -2919,6 +2985,9 @@ impl Render for Previewer {
         // 下面几项都要 `&mut cx`，而 `cx.theme()` 是不可变借用 ——
         // 所以它们必须放在拿 theme 之前（这个坑在 NEXT.md 里记着）。
         //
+        // 「适应宽度」：按当前展示区宽度重算缩放（拖动分区/改窗口都会走到这）
+        self.fit_zoom_to_viewport();
+
         // 按当前视口补出/卸载纹理。内部只在可见范围真的变了才动手，
         // 所以滚动过程中每帧调它是安全的（就是两次二分查找）。
         self.sync_visible_pages();
@@ -3057,12 +3126,12 @@ impl Render for Previewer {
             bar
         };
 
+        // 编辑区不要圆角也不要边线：只靠**底色**与展示区区分。
+        // `Input` 自带的边框/圆角/焦点描边都要关掉（appearance 管底色，保留它）。
         let editor_pane = v_flex()
-            .w(px(520.))
             .h_full()
-            .flex_shrink_0()
-            .border_r_1()
-            .border_color(theme.border)
+            .min_w_0()
+            .bg(theme.background)
             // 双击编辑区 → 显示区。
             //
             // **不阻止事件**：编辑器自己的「双击选词」照常发生，
@@ -3079,7 +3148,12 @@ impl Render for Previewer {
                     cx.notify();
                 }),
             )
-            .child(Input::new(&self.editor).flex_1());
+            .child(
+                Input::new(&self.editor)
+                    .bordered(false)
+                    .focus_bordered(false)
+                    .flex_1(),
+            );
 
         // 布局尺寸一律用 `page_sizes`（按 pt 算出来的），**不用纹理的像素尺寸**。
         // 两者能对上（纹理 = pt × ppp，逻辑 = 纹理 / 屏缩放 = pt × 96/72 × zoom），
@@ -3130,9 +3204,7 @@ impl Render for Previewer {
                                 .child(format!("第 {} 页", i + 1))
                                 .into_any_element(),
                         };
-                        let page_no = i + 1;
-                        let current = page_no == self.current_page + 1;
-                        let page = div()
+                        div()
                             // 高亮要绝对定位在页内，所以页框得是定位上下文
                             .relative()
                             .bg(gpui::white())
@@ -3184,27 +3256,6 @@ impl Render for Previewer {
                                         .into_any_element()
                                 })
                             }))
-                            // 分页显示：页码贴在每页下方（不随缩放变大小）
-                            .into_any_element();
-                        v_flex()
-                            .flex_shrink_0()
-                            .items_center()
-                            .gap_1()
-                            .child(page)
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(if current {
-                                        theme.foreground
-                                    } else {
-                                        theme.muted_foreground
-                                    })
-                                    .child(if current {
-                                        format!("第 {page_no} 页 / 共 {} 页", self.bitmaps.len())
-                                    } else {
-                                        format!("{page_no} / {}", self.bitmaps.len())
-                                    }),
-                            )
                             .into_any_element()
                     }),
             );
@@ -3238,14 +3289,20 @@ impl Render for Previewer {
             .bg(theme.background)
             .child(self.render_menu(cx))
             .child(toolbar)
+            // 中间三块用可拖动分区：编辑区与展示区的分界**能左右拖**
+            // （拖的时候预览会自动按新宽度重排 —— 见 `fit_zoom_to_viewport`）
             .child(
-                h_flex()
-                    .flex_1()
-                    .w_full()
-                    .overflow_hidden()
-                    .child(sidebar_pane)
-                    .child(editor_pane)
-                    .child(self.render_right_pane(preview_pane, cx)),
+                // 注意：`ResizablePanelGroup` 自己的 render 里已经 `size_full +
+                // flex_1 + min_h_0/min_w_0`，所以这里**不要**再调 flex_1（它没有
+                // 实现 Styled，调了也编译不过），直接当 flex 子项放就行。
+                h_resizable("main-split")
+                    .child(resizable_panel().size(px(240.)).child(sidebar_pane))
+                    .child(resizable_panel().size(px(520.)).child(editor_pane))
+                    .child(
+                        resizable_panel()
+                            .size(px(640.))
+                            .child(self.render_right_pane(preview_pane, cx)),
+                    ),
             )
             .children(self.shell_visible.then(|| self.render_shell(cx)))
             // 状态栏贴窗口最底：上面是内容，最下面一条是状态
@@ -3262,7 +3319,7 @@ impl Render for Previewer {
                 this.set_zoom(next, cx);
             }))
             .on_action(cx.listener(|this, _: &ZoomReset, _window, cx| {
-                this.set_zoom(1.0, cx);
+                this.fit_zoom(cx);
             }))
             .on_action(cx.listener(|this, _: &SaveFile, _window, cx| {
                 this.save_file(cx);
