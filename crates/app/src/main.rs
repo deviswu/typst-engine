@@ -265,13 +265,25 @@ impl Render for Previewer {
 
         if decoded.len() == self.svg_pages.len() {
             if !decoded.is_empty() && !self.rasterize_reported {
+                // 把实际光栅化出来的纹理尺寸也报出来 —— 它决定了缩放上限与显存占用。
+                let svg_lens: Vec<usize> = self.svg_pages.iter().map(|s| s.len()).collect();
                 eprintln!(
-                    "[typst-live] 已解码 {} 页（每页 {} KiB SVG）",
+                    "[typst-live] SVG → 纹理：{} 页；SVG 总共 {} KiB（最大一页 {} KiB）",
                     decoded.len(),
-                    self.svg_pages.iter().map(|s| s.len()).sum::<usize>()
-                        / decoded.len().max(1)
-                        / 1024
+                    svg_lens.iter().sum::<usize>() / 1024,
+                    svg_lens.iter().max().copied().unwrap_or(0) / 1024,
                 );
+                for (i, img) in decoded.iter().enumerate() {
+                    let px = img.size(0);
+                    let bytes = img.as_bytes(0).map(|b| b.len()).unwrap_or(0);
+                    eprintln!(
+                        "[typst-live]   第 {} 页纹理：{}×{} 像素，BGRA {} KiB",
+                        i + 1,
+                        px.width.0,
+                        px.height.0,
+                        bytes / 1024,
+                    );
+                }
                 self.rasterize_reported = true;
             }
             self.bitmaps = decoded;
