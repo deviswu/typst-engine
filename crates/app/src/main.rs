@@ -126,6 +126,14 @@ struct Previewer {
     doc: Option<Arc<PagedDocument>>,
     /// 缩放倍率。1.0 = 屏幕上「实际大小」（96 dpi）。
     zoom: f32,
+    /// 窗口所在显示器的缩放系数（Windows 的「缩放与布局」，常见 1.0 / 1.25 / 1.5）。
+    ///
+    /// **必须参与光栅化**：`zoom` 说的是「文档要占多大的逻辑尺寸」，
+    /// 而真正要填满的是**物理像素**。1 逻辑像素 = `scale_factor` 个物理像素，
+    /// 所以按 96 dpi 出图、再让 gpui 按 1.5 放大，结果就是糊的。
+    /// （初版就踩了这个坑：把「1 纹理像素 = 1 逻辑像素」当成了
+    /// 「1 纹理像素 = 1 物理像素」，于是在 150% 缩放的屏上字发虚。）
+    scale_factor: f32,
     /// 文档大纲。来自 `typst-syntax`，不是正则。
     outline: Vec<lang::OutlineItem>,
     /// 本次排版产出的原始诊断。留着是因为要把它们**映射成字节范围**
@@ -195,6 +203,7 @@ impl Previewer {
             editor,
             doc: None,
             zoom: 1.0,
+            scale_factor: window.scale_factor(),
             outline: Vec::new(),
             compile_errors: Vec::new(),
             error_count: 0,
@@ -330,7 +339,7 @@ impl Previewer {
             return;
         };
 
-        let ppp = pixel_per_pt_for_zoom(self.zoom);
+        let ppp = pixel_per_pt_for_zoom(self.zoom) * self.scale_factor;
         let t = Instant::now();
         let pages = rasterize(&doc, ppp);
         self.status.raster_ms = t.elapsed().as_secs_f64() * 1000.0;
@@ -341,9 +350,10 @@ impl Previewer {
         self.bitmaps = pages.into_iter().filter_map(to_texture).collect();
 
         println!(
-            "[typst-live] 光栅化 {} 页 @ {:.0}% ({:.2} px/pt)：{:.1} ms，纹理共 {:.1} MiB",
+            "[typst-live] 光栅化 {} 页 @ {:.0}% × 屏缩放 {:.2}（{:.2} px/pt）：{:.1} ms，纹理共 {:.1} MiB",
             self.bitmaps.len(),
             self.zoom * 100.0,
+            self.scale_factor,
             ppp,
             self.status.raster_ms,
             total as f64 / (1024.0 * 1024.0),
@@ -657,7 +667,19 @@ fn to_texture(page: RasterPage) -> Option<Arc<RenderImage>> {
 }
 
 impl Render for Previewer {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 窗口可能被拖到另一块缩放不同的显示器上。
+        // 系数变了就得按新的重新出图，否则要么糊（变大）、要么白费显存（变小）。
+        let scale_factor = window.scale_factor();
+        if (scale_factor - self.scale_factor).abs() > f32::EPSILON {
+            println!(
+                "[typst-live] 显示器缩放变了：{:.2} → {:.2}，重新出图",
+                self.scale_factor, scale_factor
+            );
+            self.scale_factor = scale_factor;
+            self.rerasterize();
+        }
+
         let theme = cx.theme();
         let has_errors = !self.compile_errors.is_empty();
 
@@ -683,10 +705,14 @@ impl Render for Previewer {
             .items_center()
             .children(self.bitmaps.iter().map(|bitmap| {
                 let size = bitmap.size(0);
+                // 纹理是**物理像素**，而布局用的是**逻辑像素** —— 除回缩放系数
+                // 就是 1:1 映射，一个物理像素对一个物理像素，字才不发虚。
+                let logical_w = size.width.0 as f32 / self.scale_factor;
+                let logical_h = size.height.0 as f32 / self.scale_factor;
                 div().bg(gpui::white()).shadow_md().overflow_hidden().child(
                     img(ImageSource::Render(bitmap.clone()))
-                        .w(px(size.width.0 as f32))
-                        .h(px(size.height.0 as f32)),
+                        .w(px(logical_w))
+                        .h(px(logical_h)),
                 )
             }));
 
