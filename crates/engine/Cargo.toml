@@ -1,0 +1,15 @@
+[package]
+name = "typst-engine"
+version.workspace = true
+edition.workspace = true
+description = "Typst 的实时增量编译引擎（UI 无关）"
+
+[dependencies]
+typst.workspace = true
+typst-syntax.workspace = true
+typst-layout.workspace = true
+typst-kit.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

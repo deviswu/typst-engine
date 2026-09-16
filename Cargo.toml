@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.92"
+
+[workspace.dependencies]
+# 只用 crates.io 官方版本。禁止 [patch.crates-io] 与 git 依赖（验收 A7）。
+typst = "0.15.1"
+typst-syntax = "0.15.1"
+typst-layout = "0.15.1"
+typst-kit = { version = "0.15.1", features = [
+    "scan-fonts",     # 扫系统字体
+    "embedded-fonts", # typst 自带的内嵌字体（不含它，缺字体就编译不出东西）
+] }
+parking_lot = "0.12"
+
+[profile.release]
+lto = "thin"
+
+# 依赖（typst 等）在 dev 下也优化：否则 typst 在 debug 下慢到无法评估性能。
+# 我们自己的代码不优化，保证改完秒级重编。
+[profile.dev.package."*"]
+opt-level = 2
