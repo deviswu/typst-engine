@@ -20,8 +20,10 @@ typst-pdf = "0.15.1"
 # 用户得先 cargo install typstyle；我们直接链库，无子进程、无安装前置。
 typstyle-core = { version = "0.15.1", default-features = false }
 typst-kit = { version = "0.15.1", features = [
-    "scan-fonts",     # 扫系统字体
-    "embedded-fonts", # typst 自带的内嵌字体（不含它，缺字体就编译不出东西）
+    "scan-fonts",        # 扫系统字体
+    "embedded-fonts",    # typst 自带的内嵌字体（不含它，缺字体就编译不出东西）
+    "system-packages",   # `@preview/...` 的官方包源（含目录约定）
+    "system-downloader", # 下载器：ureq + 系统 TLS，不引 tokio
 ] }
 parking_lot = "0.12"
 
