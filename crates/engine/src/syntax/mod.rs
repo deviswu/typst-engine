@@ -31,10 +31,12 @@
 //! 后两者共用一份 `DiagSpan → 字节范围` 的映射代码 —— 因为
 //! `SyntaxDiagnostic.span` 与 `SourceDiagnostic.span` 本来就是同一个类型。
 
+mod completion;
 mod diagnostic;
 mod outline;
 mod stats;
 
+pub use completion::*;
 pub use diagnostic::*;
 pub use outline::*;
 pub use stats::*;

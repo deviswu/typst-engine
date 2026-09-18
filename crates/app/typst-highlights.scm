@@ -79,7 +79,7 @@
 "end" @operator
 
 (escape) @constant.character.escape
-["(" ")" "{" "}"] @punctuation.bracket
+["(" ")" "[" "]" "{" "}"] @punctuation.bracket
 ["," ";" ".." ":" "sep"] @punctuation.delimiter
 "assign" @punctuation
 (field "." @punctuation)

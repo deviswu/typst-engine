@@ -12,8 +12,31 @@ path = "src/main.rs"
 # gpui 版本锁定：与 wu / jicheng 完全一致的组合（已在那些项目验证过）
 gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["font-kit"] }
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "1505b1487131adbb443f6c69e87847db35bfa2d1" }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "1505b1487131adbb443f6c69e87847db35bfa2d1" }
+# gpui-component：**这两行指向我们自己的 fork**，是全项目唯一一处偏离上游的地方。
+#
+# 理由：上游 `1505b148` 在 `input/element.rs::layout_lines` 里用 `debug_assert_eq!`
+# 校验「wrap map 记的行长 == 实际文本行长」。输入法合成中文时这两者会差一拍
+# （记账里还是 1 字节的拼音、文本已是 3 字节的汉字，实测 `left: 1, right: 3`），
+# 于是断言响；更糟的是 panic 发生在窗口过程里、展开不了，展开途中又有任务去
+# 借已被借用的 `App`，第二条 panic 直接把进程 fastfail 掉（0xc0000409）——
+# 症状是「打中文打到一半，编辑器整个消失」。release 里断言虽被编掉，后面那句
+# `line_text[range]` 拿脏区间切片同样 panic（且汉字会踩非字符边界）。
+#
+# fork 只改了三处（分支 `fix/input-stale-wrap-map`，基线就是上游 `1505b148`）：
+# ① 上面那条断言 → 改成“行长不一致时按整行单段排版”；
+# ② `resizable/panel.rs`：给 `ResizablePanelGroup` 补 `.flex_1() + .min_h_0() + .min_w_0()`
+#    （只写 `size_full()` 的话，在 taffy 里“父尺寸由 flex 分配”时那个百分比解析不了，
+#     flex-basis:auto 退回内容尺寸 → panel 被内容（一页 A4 高）撑破，
+#     **后面的终端面板与状态栏会被整条挤出窗口**）；
+# ③ `input/element.rs`：行号列宽按实际位数算、prepaint 里复用开头那份 text_style。
+#
+# ②③ 是 2026-08-28 调 jicheng 时**就地改在 `~/.cargo/git/checkouts/` 那份 checkout 里的**，
+# 从没入过版本库 —— 而 cargo 不校验 checkout，于是这个 app 一直依赖着那三行“幽灵改动”。
+# 换到干净的 fork 源后立刻原形毕露（状态栏与终端面板整条不见）。所以把它一并搬进 fork，
+# 让依赖变回“源码里写清楚的东西”。那个 checkout **没有动**：wu / jicheng 还在靠它。
+# 上游合并后（或下次升级 gpui-component 时）把这两行换回官方 rev 即可。
+gpui-component = { git = "https://github.com/deviswu/gpui-kit", rev = "66eb1a8a0eaebb00d948868de7a3afc6b861021c" }
+gpui-component-assets = { git = "https://github.com/deviswu/gpui-kit", rev = "66eb1a8a0eaebb00d948868de7a3afc6b861021c" }
 
 # 引擎
 typst-engine = { path = "../engine" }
@@ -38,6 +61,15 @@ serde_json = "1"
 
 # AI 改稿应用前的行级 diff（wu 用的同一个 crate）
 similar = "2"
+
+# 编辑器能力：补全（CompletionProvider）与底色标记（DocumentColorProvider）
+# 都定义在 gpui-component 的 input::lsp 里，它们的签名用的是这两个 crate 的类型
+# —— 版本必须与 gpui-component 的 workspace 一致，否则 trait 对不上。
+# （`lsp-types` 0.97 + `ropey` 2.0.0-beta.1，见 gpui-component 根 Cargo.toml。）
+lsp-types = { version = "0.97", features = ["proposed"] }
+ropey = "=2.0.0-beta.1"
+# 上面两个 trait 的方法签名就是 `anyhow::Result<…>`，所以要用同一个 anyhow 版本。
+anyhow = "1"
 
 [dev-dependencies]
 # finder 的扫描测试要造临时目录

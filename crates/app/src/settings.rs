@@ -56,6 +56,25 @@ pub struct Settings {
     /// 亮/暗不用单独存：`Theme::apply_config` 会把配置放进对应那一侧，
     /// 名字本身就带着模式（`ThemeConfig.mode`）—— 存两份迟早会不一致。
     pub theme: Option<String>,
+    /// 预览区背景样式：`solid`（纯色，默认）或 `grid`（网格）。
+    pub preview_bg: Option<String>,
+    /// 跟随光标：光标停下就把预览滚到对应位置（默认关 —— 它会抢滚动）。
+    pub follow_cursor: Option<bool>,
+    /// 编辑器代码折叠（`gpui-component` 默认就是开，所以「没这项」= 开）。
+    pub folding: Option<bool>,
+    /// 状态栏要不要显示性能指标（排版/光栅化/重解析/纹理……）。
+    /// 默认**关**：状态栏保持精简，排查时才从「视图」菜单里打开。
+    pub show_metrics: Option<bool>,
+    /// 自动保存（打字停下 1 秒后写盘）。默认**开**。
+    ///
+    /// 只对「用户显式打开的文件」生效 —— 内置示例文档永远不写盘，那条守卫
+    /// 与这个开关无关（见 `autosave::should_save`）。
+    pub autosave: Option<bool>,
+    /// 最近用过的文件夹（目录树根），按最近使用排序。
+    ///
+    /// 一条一行（`recent_dir=...`）而不是拼成一行 —— 路径里可能有任何字符，
+    /// 拼起来就得发明分隔符与转义规则。
+    pub recent_dirs: Vec<PathBuf>,
 }
 
 impl Settings {
@@ -78,13 +97,28 @@ impl Settings {
     }
 
     /// 写到指定文件。
+    ///
+    /// **先写临时文件再改名**（同目录，才能保证是同一卷上的原子替换）：
+    /// 直接覆盖原文件的话，写一半崩/断电会把设置文件截断成半截 ——
+    /// 解析再容错也救不回被砍掉的内容。
     pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
         if let Some(dir) = path.parent()
             && !dir.as_os_str().is_empty()
         {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(path, self.render())
+
+        let mut tmp = path.as_os_str().to_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+
+        std::fs::write(&tmp, self.render())?;
+        // Windows 上 `rename` 覆盖已存在的文件是允许的（MoveFileEx + REPLACE_EXISTING）
+        if let Err(err) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// `key=value` 文本 → 设置。
@@ -109,6 +143,17 @@ impl Settings {
                 "file" if !value.is_empty() => out.file = Some(PathBuf::from(value)),
                 "zoom" => out.zoom = value.parse::<f32>().ok().filter(|z| z.is_finite()),
                 "theme" if !value.is_empty() => out.theme = Some(value.to_owned()),
+                "preview_bg" if !value.is_empty() => out.preview_bg = Some(value.to_owned()),
+                "follow_cursor" => out.follow_cursor = value.parse::<bool>().ok(),
+                "folding" => out.folding = value.parse::<bool>().ok(),
+                "show_metrics" => out.show_metrics = value.parse::<bool>().ok(),
+                "autosave" => out.autosave = value.parse::<bool>().ok(),
+                // 最近文件夹是多行：每行一条，读进来就往后排
+                "recent_dir" if !value.is_empty() => {
+                    if out.recent_dirs.len() < super::MAX_RECENT_DIRS {
+                        out.recent_dirs.push(PathBuf::from(value));
+                    }
+                }
                 "ai_base_url" if !value.is_empty() => out.ai_base_url = Some(value.to_owned()),
                 "ai_model" if !value.is_empty() => out.ai_model = Some(value.to_owned()),
                 "ai_api_key" if !value.is_empty() => out.ai_api_key = Some(value.to_owned()),
@@ -134,6 +179,24 @@ impl Settings {
         }
         if let Some(theme) = &self.theme {
             out.push_str(&format!("theme={theme}\n"));
+        }
+        if let Some(style) = &self.preview_bg {
+            out.push_str(&format!("preview_bg={style}\n"));
+        }
+        if let Some(on) = self.follow_cursor {
+            out.push_str(&format!("follow_cursor={on}\n"));
+        }
+        if let Some(on) = self.folding {
+            out.push_str(&format!("folding={on}\n"));
+        }
+        if let Some(on) = self.show_metrics {
+            out.push_str(&format!("show_metrics={on}\n"));
+        }
+        if let Some(on) = self.autosave {
+            out.push_str(&format!("autosave={on}\n"));
+        }
+        for dir in self.recent_dirs.iter().take(super::MAX_RECENT_DIRS) {
+            out.push_str(&format!("recent_dir={}\n", dir.display()));
         }
         if let Some(url) = &self.ai_base_url {
             out.push_str(&format!("ai_base_url={url}\n"));
@@ -172,6 +235,15 @@ mod tests {
             file: Some(PathBuf::from("/tmp/docs/报告.typ")),
             zoom: Some(1.25),
             theme: Some("Default Dark".to_owned()),
+            preview_bg: Some("grid".to_owned()),
+            follow_cursor: Some(true),
+            folding: Some(false),
+            show_metrics: Some(true),
+            autosave: Some(false),
+            recent_dirs: vec![
+                PathBuf::from("D:/工作/钻头型号排名"),
+                PathBuf::from("C:/Users/admin/文档"),
+            ],
             ai_base_url: Some("http://127.0.0.1:11434/v1/chat/completions".to_owned()),
             ai_model: Some("qwen3".to_owned()),
             ai_api_key: Some("sk-本地测试".to_owned()),
@@ -231,7 +303,42 @@ mod tests {
         assert_eq!(settings.file, Some(PathBuf::from("C:\\my docs\\a=b.typ")));
     }
 
-    /// 没有的项不写行 —— 不然文件里会堆一堆 `zoom=1` 这种「假装设过」的东西。
+    /// 最近文件夹：多行存、按顺序读回来；超过上限就截断。
+    #[test]
+    fn recent_dirs_are_stored_one_per_line_and_capped() {
+        let many: Vec<PathBuf> = (0..crate::MAX_RECENT_DIRS + 5)
+            .map(|i| PathBuf::from(format!("C:/dir{i}")))
+            .collect();
+        let text = Settings {
+            recent_dirs: many,
+            ..Settings::default()
+        }
+        .render();
+
+        assert_eq!(text.matches("recent_dir=").count(), crate::MAX_RECENT_DIRS);
+
+        let back = Settings::parse(&text);
+        assert_eq!(back.recent_dirs.len(), crate::MAX_RECENT_DIRS);
+        assert_eq!(
+            back.recent_dirs[0],
+            PathBuf::from("C:/dir0"),
+            "顺序要保住（最近的在最前）"
+        );
+    }
+
+    /// 路径里的空格、反斜杠、等号都不能破坏这一行。
+    #[test]
+    fn a_recent_dir_with_awkward_characters_survives() {
+        let dir = PathBuf::from(r"C:\Users\admin\我的 文档\a=b");
+        let text = Settings {
+            recent_dirs: vec![dir.clone()],
+            ..Settings::default()
+        }
+        .render();
+
+        assert_eq!(Settings::parse(&text).recent_dirs, vec![dir]);
+    }
+
     #[test]
     fn absent_items_produce_no_lines() {
         let text = Settings::default().render();
@@ -241,12 +348,52 @@ mod tests {
             "file=",
             "zoom=",
             "theme=",
+            "preview_bg=",
+            "follow_cursor=",
+            "folding=",
+            "show_metrics=",
+            "autosave=",
+            "recent_dir=",
             "ai_base_url=",
             "ai_model=",
             "ai_api_key=",
         ] {
             assert!(!text.contains(key), "空的设置不该写 `{key}`：{text:?}");
         }
+    }
+
+    /// 布尔项：`true`/`false` 都要能存能读，写坏的值当没有。
+    #[test]
+    fn boolean_items_round_trip_and_tolerate_garbage() {
+        let text = Settings {
+            follow_cursor: Some(true),
+            folding: Some(false),
+            autosave: Some(false),
+            ..Settings::default()
+        }
+        .render();
+
+        assert!(text.contains("follow_cursor=true"), "{text:?}");
+        assert!(text.contains("folding=false"), "{text:?}");
+        assert!(text.contains("autosave=false"), "{text:?}");
+
+        let parsed = Settings::parse("follow_cursor=true\nfolding=false\nautosave=false\n");
+        assert_eq!(parsed.follow_cursor, Some(true));
+        assert_eq!(parsed.folding, Some(false));
+        assert_eq!(parsed.autosave, Some(false));
+
+        let broken = Settings::parse("follow_cursor=也许\nfolding=\nautosave=\n");
+        assert_eq!(broken.follow_cursor, None, "解析不了就别当设置");
+        assert_eq!(broken.folding, None);
+        assert_eq!(broken.autosave, None);
+    }
+
+    /// 「没这项」= 用代码里的默认值。自动保存的默认是**开**，
+    /// 所以一份空设置必须解析成 `None`（而不是 `Some(false)`）——
+    /// 写成后者的话，老设置文件会把自动保存静默关掉。
+    #[test]
+    fn autosave_absent_means_none_not_false() {
+        assert_eq!(Settings::parse("").autosave, None);
     }
 
     #[test]
@@ -262,5 +409,35 @@ mod tests {
             Settings::load_from(&dir.path().join("没有这个文件")),
             Settings::default()
         );
+    }
+
+    /// 写盘是「临时文件 + 改名」：**不能留下 `.tmp` 残骸**，
+    /// 也不能出现「原文件被截断」这种中间状态（那正是原子替换要防的事）。
+    #[test]
+    fn saving_replaces_atomically_and_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+
+        Settings {
+            zoom: Some(3.0),
+            ..Settings::default()
+        }
+        .save_to(&path)
+        .unwrap();
+
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "改名之后不该留下临时文件：{leftovers:?}"
+        );
+
+        // 再存一次（覆盖已存在的文件）也要能成
+        sample().save_to(&path).unwrap();
+        assert_eq!(Settings::load_from(&path), sample());
     }
 }

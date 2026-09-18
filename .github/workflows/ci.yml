@@ -1,0 +1,41 @@
+name: CI
+
+# 这个仓库一直靠「本地 cargo fmt / clippy / test 都干净」这句口头约定。
+# 公开仓库 + 长期只有一个人推代码时，那条约定的有效期取决于记性；
+# 换成一条在 push 上跑的流水线，有效期取决于机器。
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    # Windows：这是本项目的**唯一**目标平台（GUI 子系统、DPI、ConPTY 都是
+    # 平台相关的行为），在 Linux 上过一遍证明不了什么。
+    runs-on: windows-latest
+    # gpui 与 gpui-component 是 git 依赖，首次拉取 + 编译要十几分钟。
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 格式：仓库里的代码一律过 rustfmt，不留「顺手拉一下就好」的差异。
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      # 警告即失败：clippy 的默认警告里有一半是「以后会变成 bug」的写法。
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # 220+ 条测试，绝大多数在引擎侧（UI 无关、能无头跑）。
+      - name: cargo test
+        run: cargo test --workspace

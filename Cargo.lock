@@ -2708,7 +2708,7 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.5.2"
-source = "git+https://github.com/longbridge/gpui-component?rev=1505b1487131adbb443f6c69e87847db35bfa2d1#1505b1487131adbb443f6c69e87847db35bfa2d1"
+source = "git+https://github.com/deviswu/gpui-kit?rev=66eb1a8a0eaebb00d948868de7a3afc6b861021c#66eb1a8a0eaebb00d948868de7a3afc6b861021c"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2758,7 +2758,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-assets"
 version = "0.5.1"
-source = "git+https://github.com/longbridge/gpui-component?rev=1505b1487131adbb443f6c69e87847db35bfa2d1#1505b1487131adbb443f6c69e87847db35bfa2d1"
+source = "git+https://github.com/deviswu/gpui-kit?rev=66eb1a8a0eaebb00d948868de7a3afc6b861021c#66eb1a8a0eaebb00d948868de7a3afc6b861021c"
 dependencies = [
  "anyhow",
  "gpui",
@@ -2772,7 +2772,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.5.1"
-source = "git+https://github.com/longbridge/gpui-component?rev=1505b1487131adbb443f6c69e87847db35bfa2d1#1505b1487131adbb443f6c69e87847db35bfa2d1"
+source = "git+https://github.com/deviswu/gpui-kit?rev=66eb1a8a0eaebb00d948868de7a3afc6b861021c#66eb1a8a0eaebb00d948868de7a3afc6b861021c"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8282,12 +8282,15 @@ name = "typst-live"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
+ "anyhow",
  "codebook-tree-sitter-typst",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
  "gpui_platform",
  "image",
+ "lsp-types",
+ "ropey",
  "serde",
  "serde_json",
  "similar",

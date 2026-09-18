@@ -88,6 +88,48 @@ pub fn scan_dir(dir: &Path) -> Vec<FsNode> {
     scan_dir_at(dir, 0)
 }
 
+/// 目录里的**子目录**（只一层，按名字排序），跳过隐藏目录与重目录。
+///
+/// 给「打开文件夹…」那个选择器用：一层一层点下去找目录，比一次扫全树快得多，
+/// 也不用管展开状态。
+pub fn subdirs(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            // 隐藏目录（`.git` 这种）与重目录不列 —— 要进也得有别的办法
+            !name.starts_with('.') && !is_heavy_dir(&name)
+        })
+        .collect();
+
+    out.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    out
+}
+
+/// 最顶层的可选位置：Windows 是各个存在的盘符，其它平台就是 `/`。
+pub fn roots() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        (b'A'..=b'Z')
+            .map(|letter| PathBuf::from(format!("{}:\\", letter as char)))
+            .filter(|path| path.exists())
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        vec![PathBuf::from("/")]
+    }
+}
+
 fn scan_dir_at(dir: &Path, depth: usize) -> Vec<FsNode> {
     let mut nodes = Vec::new();
     if depth > MAX_DEPTH {
@@ -277,5 +319,38 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 子目录列表：只列一层、按名字排序、跳过隐藏与重目录。
+    #[test]
+    fn subdirs_lists_only_visible_directories() {
+        let dir = fixture("picker");
+        let sub = dir.join("subdirs");
+        std::fs::create_dir_all(sub.join("b")).unwrap();
+        std::fs::create_dir_all(sub.join("a")).unwrap();
+        std::fs::create_dir_all(sub.join(".hidden")).unwrap();
+        std::fs::create_dir_all(sub.join("target")).unwrap();
+        std::fs::write(sub.join("文件.typ"), "hi").unwrap();
+
+        let dirs: Vec<String> = subdirs(&sub)
+            .into_iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+
+        assert_eq!(dirs, vec!["a", "b"], "该只列可见目录，且排序");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 读不了的目录给空表，不 panic。
+    #[test]
+    fn subdirs_of_a_missing_dir_is_empty() {
+        assert!(subdirs(Path::new("C:/这个目录不存在-typst-live")).is_empty());
+    }
+
+    /// 顶层位置至少有一个（Windows 上是存在的盘符）。
+    #[test]
+    fn roots_is_never_empty() {
+        assert!(!roots().is_empty());
     }
 }

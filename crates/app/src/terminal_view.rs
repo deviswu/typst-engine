@@ -629,35 +629,86 @@ impl Element for TerminalElement {
 
             // 鼠标：点击聚焦 + 拖拽选择文本
             let focus_for_click = self.focus.clone();
+            // 一次拖拽只记一行日志：诊断「拖拽事件到底有没有到」用，平时不刷屏
+            let dragging_logged = std::rc::Rc::new(std::cell::Cell::new(false));
+            let dragging_logged_down = dragging_logged.clone();
             let down_terminal = self.terminal.clone();
             let sel_ox = bounds.origin.x;
             let sel_oy = bounds.origin.y;
             let sel_cw = layout.cell_width;
             let sel_lh = layout.line_height;
+            // 一次拖拽只记一行日志：诊断「拖拽事件到底有没有到」用，平时不刷屏
+
             self.interactivity
                 .on_mouse_down(MouseButton::Left, move |e, window, cx| {
                     window.focus(&focus_for_click, cx);
                     let col = ((e.position.x - sel_ox) / sel_cw).floor().max(0.0) as usize;
                     let row = ((e.position.y - sel_oy) / sel_lh).floor().max(0.0) as i32;
                     down_terminal.start_selection(row, col);
+                    dragging_logged_down.set(false);
+                    logln!("[typst-live] 终端：按下左键 row={row} col={col}（开始选择）");
                 });
-            // 拖拽中更新选区终点
+            // 拖拽中更新选区终点。
+            //
+            // ⚠️ 每次都要 `window.refresh()`：终端平时靠「有输出 → Wakeup → 重画」，
+            // 而拖拽期间根本没有输出 —— 不主动重画的话，选区只在下次有输出时才显形，
+            // 用起来就像「选中不了」。
             let move_terminal = self.terminal.clone();
-            self.interactivity.on_mouse_move(move |e, _window, _cx| {
+            let dragging_logged_move = dragging_logged.clone();
+            self.interactivity.on_mouse_move(move |e, window, _cx| {
                 if e.pressed_button != Some(MouseButton::Left) {
                     return;
+                }
+                if !dragging_logged_move.replace(true) {
+                    logln!("[typst-live] 终端：拖拽中（收到第一个 Move 事件）");
                 }
                 let col = ((e.position.x - sel_ox) / sel_cw).floor().max(0.0) as usize;
                 let row = ((e.position.y - sel_oy) / sel_lh).floor().max(0.0) as i32;
                 move_terminal.update_selection(row, col);
+                window.refresh();
             });
             // 松开鼠标：单击（空选区）时清掉选区，避免残留一个高亮格
             let up_terminal = self.terminal.clone();
             self.interactivity
-                .on_mouse_up(MouseButton::Left, move |_e, _window, _cx| {
-                    if up_terminal.selection_text().is_none() {
+                .on_mouse_up(MouseButton::Left, move |_e, window, _cx| {
+                    let n = up_terminal
+                        .selection_text()
+                        .map(|t| t.chars().count())
+                        .unwrap_or(0);
+                    if n == 0 {
                         up_terminal.clear_selection();
                     }
+                    logln!("[typst-live] 终端：松开左键，选中 {n} 字");
+                    window.refresh();
+                });
+
+            // 右键：**有选区就复制、没有就粘贴**（Windows 控制台/终端的老习惯，
+            // 也是最容易被发现的入口 —— 不用记快捷键）。
+            let right_terminal = self.terminal.clone();
+            self.interactivity
+                .on_mouse_down(MouseButton::Right, move |_e, window, cx| {
+                    match right_terminal.selection_text() {
+                        Some(text) => {
+                            logln!(
+                                "[typst-live] 终端复制（右键）：{} 字 → 剪贴板",
+                                text.chars().count()
+                            );
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                            right_terminal.clear_selection();
+                        }
+                        None => {
+                            if let Some(text) =
+                                cx.read_from_clipboard().and_then(|item| item.text())
+                            {
+                                logln!(
+                                    "[typst-live] 终端粘贴（右键）：{} 字 → pty",
+                                    text.chars().count()
+                                );
+                                right_terminal.paste(&text);
+                            }
+                        }
+                    }
+                    window.refresh();
                 });
 
             // 鼠标滚轮：滚动历史输出（向上滚看更早历史，向下滚回最新）
@@ -777,13 +828,44 @@ impl Element for TerminalElement {
                         if !focus_for_key.is_focused(window) {
                             return;
                         }
-                        // Ctrl+Shift+C：复制选中的终端文本
-                        if event.keystroke.key == "c"
-                            && event.keystroke.modifiers.control
-                            && event.keystroke.modifiers.shift
-                        {
-                            if let Some(text) = terminal.selection_text() {
-                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        let ctrl = event.keystroke.modifiers.control;
+                        let shift = event.keystroke.modifiers.shift;
+                        let key = event.keystroke.key.as_str();
+                        let has_selection = terminal.selection_text().is_some();
+
+                        // 复制：Ctrl+Shift+C / Ctrl+Insert，以及**有选区时的 Ctrl+C**
+                        // （没有选区时 Ctrl+C 照旧发给 shell = 中断信号，不能无条件抢）。
+                        let wants_copy = (ctrl && shift && key == "c")
+                            || (ctrl && key == "insert")
+                            || (ctrl && key == "c" && has_selection);
+
+                        // 粘贴：Ctrl+V / Ctrl+Shift+V / Shift+Insert
+                        // （跟 Windows Terminal 一致；Ctrl+V 在 shell 里本来是
+                        //  readline 的「按字面插入下一个字符」，用得极少，让给粘贴）。
+                        let wants_paste = (ctrl && key == "v")
+                            || (ctrl && shift && key == "v")
+                            || (shift && key == "insert");
+
+                        if wants_copy {
+                            match terminal.selection_text() {
+                                Some(text) => {
+                                    logln!(
+                                        "[typst-live] 终端复制：{} 字 → 剪贴板",
+                                        text.chars().count()
+                                    );
+                                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                    window.refresh();
+                                }
+                                None => logln!("[typst-live] 终端复制：没有选中文本"),
+                            }
+                            return;
+                        }
+                        if wants_paste {
+                            if let Some(text) =
+                                cx.read_from_clipboard().and_then(|item| item.text())
+                            {
+                                logln!("[typst-live] 终端粘贴：{} 字 → pty", text.chars().count());
+                                terminal.paste(&text);
                             }
                             return;
                         }

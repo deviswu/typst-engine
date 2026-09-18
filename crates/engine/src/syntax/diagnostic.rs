@@ -98,7 +98,10 @@ pub fn range_of_diag_span(source: &Source, span: &DiagSpan) -> Option<Range<usiz
 /// 字节偏移 → 行列。列按字符计。
 pub fn line_col(source: &Source, byte: usize) -> LineCol {
     let text = source.text();
-    let end = byte.min(text.len());
+    // ⚠️ `byte` 可能落在**字符中间**：span 是排版阶段累加出来的字节偏移，
+    // 中文一个字 3 字节，它踩在中间完全可能（`jump.rs` 就被同一类偏移咬过：
+    // 「中文文档建跳转索引时 panic」）。不先对齐的话，下面 `text[..end]` 直接 panic。
+    let end = floor_char_boundary(text, byte);
 
     let line = text.as_bytes()[..end]
         .iter()
@@ -108,6 +111,15 @@ pub fn line_col(source: &Source, byte: usize) -> LineCol {
     let col = text[line_start..end].chars().count();
 
     LineCol { line, col }
+}
+
+/// 把字节偏移**向下**对齐到字符边界，并夹在 `text.len()` 之内。
+fn floor_char_boundary(text: &str, byte: usize) -> usize {
+    let mut byte = byte.min(text.len());
+    while byte > 0 && !text.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    byte
 }
 
 #[cfg(test)]
@@ -146,6 +158,18 @@ mod tests {
         let s = source_with("abc");
 
         assert_eq!(line_col(&s, 999), LineCol { line: 0, col: 3 });
+    }
+
+    /// 偏移落在**汉字中间**时降到该字之前，而不是 panic（中文文档真会碰到）。
+    #[test]
+    fn a_byte_inside_a_character_does_not_panic() {
+        let s = source_with("汉字x\n");
+
+        // "汉" 占 0..3、"字" 占 3..6 → 4 落在"字"的中间，降到 3
+        assert_eq!(line_col(&s, 4), LineCol { line: 0, col: 1 });
+        assert_eq!(line_col(&s, 5), LineCol { line: 0, col: 1 });
+        // 末尾那个边界本身照常
+        assert_eq!(line_col(&s, 6), LineCol { line: 0, col: 2 });
     }
 
     /// 未闭合的括号必须被解析器报出来 —— 这是「不等编译就能提示」的基础。

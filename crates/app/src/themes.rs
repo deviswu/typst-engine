@@ -16,8 +16,10 @@
 // 只引要用的几个类型，**不要** `use gpui::*`：那会把 gpui 自己的
 // `#[gpui::test]` 宏（名字就叫 `test`）带进来，于是本文件里的 `#[test]`
 // 会解析到它头上，报「recursion limit reached while expanding #[test]」。
-use gpui::{App, SharedString, Window};
-use gpui_component::select::SelectItem;
+use std::sync::Arc;
+
+use gpui::{App, Hsla, SharedString, Window, hsla};
+use gpui_component::highlighter::{HighlightTheme, ThemeStyle};
 use gpui_component::{Theme, ThemeRegistry};
 
 /// 注册表里所有主题的名字（默认主题优先、亮色在前、其余按名字序）。
@@ -36,78 +38,58 @@ pub fn apply(name: &str, window: &mut Window, cx: &mut App) -> Option<bool> {
     let config = ThemeRegistry::global(cx).themes().get(name).cloned()?;
     let dark = config.mode.is_dark();
 
-    let theme = Theme::global_mut(cx);
-    theme.mode = config.mode;
-    theme.apply_config(&config);
+    {
+        let theme = Theme::global_mut(cx);
+        theme.mode = config.mode;
+        theme.apply_config(&config);
+    }
+
+    // 括号的颜色自己定，不跟着主题的某一路颜色走：主题里哪一路是「青」并不统一，
+    // 而这一个颜色要保证在两种底色上都显眼 —— 暗色用亮青、亮色用深青。
+    let brackets = if dark {
+        hsla(0.52, 0.85, 0.72, 1.0)
+    } else {
+        hsla(0.55, 0.78, 0.42, 1.0)
+    };
+    tint_brackets(brackets, cx);
 
     window.refresh();
     Some(dark)
 }
 
-/// 下拉列表里的一项。
-#[derive(Clone, PartialEq)]
-pub struct ThemeItem {
-    name: SharedString,
-    active: bool,
-}
+/// 把代码里的括号染成指定颜色。
+///
+/// 为什么需要这一步：主题文件里 `punctuation.bracket` 基本都是**没写**的，
+/// 于是括号跟正文一个颜色 —— 一屏代码里 `( ) [ ] { }` 全沉在字里行间，
+/// 配对读起来很费眼。这里在应用主题之后补一条自己的样式。
+///
+/// `ThemeStyle` 的字段是**私有的、也没有构造器**，唯一的构造途径是反序列化
+/// （`Hsla` 的 serde 表示就是 `Rgba { r, g, b, a }`，所以给个颜色就行）。
+/// 反序列化失败就当没这回事 —— 括号少一层颜色，不该把界面搞崩。
+fn tint_brackets(color: Hsla, cx: &mut App) {
+    let theme = Theme::global_mut(cx);
+    let mut highlight: HighlightTheme = (*theme.highlight_theme).clone();
 
-impl ThemeItem {
-    /// 全部主题；`active` 是当前那一个（列表里给它打个勾）。
-    pub fn all(active: &str, cx: &App) -> Vec<Self> {
-        names(cx)
-            .into_iter()
-            .map(|name| Self {
-                active: name.as_ref() == active,
-                name,
-            })
-            .collect()
-    }
+    let Ok(style) = serde_json::from_value::<ThemeStyle>(serde_json::json!({ "color": color }))
+    else {
+        return;
+    };
 
-    /// 当前那一个在列表里的下标（给下拉框定位用）。
-    pub fn index_of(items: &[Self]) -> Option<usize> {
-        items.iter().position(|item| item.active)
-    }
-}
-
-impl SelectItem for ThemeItem {
-    type Value = SharedString;
-
-    fn title(&self) -> SharedString {
-        self.name.clone()
-    }
-
-    fn value(&self) -> &Self::Value {
-        &self.name
-    }
+    highlight.style.syntax.punctuation_bracket = Some(style);
+    theme.highlight_theme = Arc::new(highlight);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// `ThemeStyle` 只能从 JSON 造 —— 这条测试盯着那条路别断。
     #[test]
-    fn index_of_finds_the_active_one() {
-        let items = vec![
-            ThemeItem {
-                name: "A".into(),
-                active: false,
-            },
-            ThemeItem {
-                name: "B".into(),
-                active: true,
-            },
-        ];
+    fn a_bracket_style_can_be_built_from_a_color() {
+        let style = serde_json::from_value::<ThemeStyle>(
+            serde_json::json!({ "color": gpui::hsla(0.5, 0.6, 0.6, 1.0) }),
+        );
 
-        assert_eq!(ThemeItem::index_of(&items), Some(1));
-    }
-
-    #[test]
-    fn index_of_gives_none_when_nothing_is_active() {
-        let items = vec![ThemeItem {
-            name: "A".into(),
-            active: false,
-        }];
-
-        assert_eq!(ThemeItem::index_of(&items), None);
+        assert!(style.is_ok(), "括号的样式没造出来：{style:?}");
     }
 }

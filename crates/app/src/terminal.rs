@@ -9,7 +9,7 @@ use alacritty_terminal::{
     index::{Column, Line, Point, Side},
     selection::{Selection, SelectionType},
     sync::FairMutex,
-    term::{Config, RenderableContent, Term},
+    term::{Config, RenderableContent, Term, TermMode},
     tty,
 };
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
@@ -130,6 +130,19 @@ impl Terminal {
         self.notifier.notify(bytes.to_vec());
     }
 
+    /// 终端是不是处于「括号粘贴」模式（shell/编辑器发的 `\e[?2004h`）。
+    ///
+    /// 开着的时候粘贴要包一层 `\e[200~ … \e[201~`：不然多行文本会被
+    /// shell 逐行当成「回车」执行（粘一段命令进去就变成连跑好几条）。
+    pub fn bracketed_paste(&self) -> bool {
+        self.term.lock().mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
+    /// 把一段文本粘贴进终端。
+    pub fn paste(&self, text: &str) {
+        self.write_input(&paste_bytes(text, self.bracketed_paste()));
+    }
+
     /// 滚动显示（查看历史输出）。
     ///
     /// `delta_lines`：正数向上滚（看更早历史），负数向下滚（回最新）。
@@ -160,13 +173,11 @@ impl Terminal {
     }
 
     /// 关闭终端（发送 Shutdown，结束事件循环与子进程）。
-    /// 主动收掉这个终端。
     ///
-    /// 目前**没有调用方**：gpui 这个 rev 没有可靠的「窗口即将关闭」钩子，
-    /// 而 `Rc<Terminal>` 一落地，alacritty 的 EventLoop 会跟着收掉 pty。
-    /// 留着是因为它属于这个封装该有的能力（真出问题时得能手动关），
-    /// 不是「写了没用」的代码 —— 但也不许再悄悄进来第二个这样的。
-    #[allow(dead_code)]
+    /// **关窗时必须调它**（见 `Previewer::shutdown_terminal`）：`Msg::Shutdown` 会让
+    /// alacritty 的 `EventLoop` 从 `process_events` 返回 false 而退出，它持有的
+    /// ConPTY 随之析构 —— 关掉伪控制台，附着在上面的 PowerShell 才会结束。
+    /// 不调的话，子进程就只能指望「进程退出」帮忙收尸（崩溃/被强杀时连这个都没有）。
     pub fn shutdown(&self) {
         let _ = self.notifier.0.send(Msg::Shutdown);
     }
@@ -219,5 +230,53 @@ impl Terminal {
     pub fn selection_text(&self) -> Option<String> {
         let term = self.term.lock();
         term.selection_to_string().filter(|s| !s.is_empty())
+    }
+}
+
+/// 粘贴文本 → 送进 PTY 的字节。
+///
+/// 抽成自由函数是为了**能测** —— 两个坑都在这里：
+///
+/// 1. **换行必须是 `\r`**：终端里的「回车」是 CR。只送 `\n` 到 PowerShell 提示符上
+///    只是把光标移到下一行、**不执行** —— 用起来就是「粘贴没反应」。
+/// 2. **括号粘贴模式**（shell/编辑器发的 `\e[?2004h`）开着时要包一层
+///    `\e[200~ … \e[201~`，否则粘多行会被逐行当成回车执行。
+pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+    if bracketed {
+        format!("\x1b[200~{normalized}\x1b[201~").into_bytes()
+    } else {
+        normalized.into_bytes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::paste_bytes;
+
+    /// LF 与 CRLF 都要变成 CR —— 不然 PowerShell 提示符上「粘了不执行」。
+    #[test]
+    fn paste_normalizes_newlines_to_cr() {
+        assert_eq!(paste_bytes("a\nb", false), b"a\rb".to_vec());
+        assert_eq!(paste_bytes("a\r\nb", false), b"a\rb".to_vec());
+        assert_eq!(
+            paste_bytes("echo hi\necho bye", false),
+            b"echo hi\recho bye".to_vec()
+        );
+    }
+
+    /// 括号粘贴模式：多行要包起来，shell 才不会逐行执行。
+    #[test]
+    fn paste_wraps_when_bracketed() {
+        assert_eq!(
+            paste_bytes("a\nb", true),
+            b"\x1b[200~a\rb\x1b[201~".to_vec()
+        );
+    }
+
+    /// 普通单行粘贴：原样，一个字节都不多。
+    #[test]
+    fn paste_keeps_plain_text_intact() {
+        assert_eq!(paste_bytes("git status", false), b"git status".to_vec());
     }
 }

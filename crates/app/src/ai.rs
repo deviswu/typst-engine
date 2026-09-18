@@ -14,7 +14,6 @@
 //! 思考模型的 `reasoning_content` 计进度但不写进正文。
 
 use std::io::{BufRead, Read};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -87,11 +86,13 @@ pub fn is_local_endpoint(url: &str) -> bool {
     url.contains("127.0.0.1") || url.contains("localhost") || url.contains("0.0.0.0")
 }
 
-/// 鉴权 Key：环境变量 `AI_API_KEY` > 设置值 > `~/.pi/agent/auth.json` 里的 deepseek.key。
+/// 鉴权 Key：环境变量 `AI_API_KEY` > 设置值。
 ///
-/// 最后一级只是历史兼容（`wu` 当年借用了 pi 的凭据文件）；
-/// 正经用法是设环境变量或在设置文件里填 `ai_api_key`。
-pub fn api_key(endpoint: &str, from_settings: Option<&str>) -> Option<String> {
+/// **刻意不做「顺手读别的工具的凭据文件」那一步**：曾经回退去读
+/// `~/.pi/agent/auth.json`（`wu` 当年借用了 pi 的凭据）。那是隐式跨工具耦合 ——
+/// 换台机器、装了别的 CLI、那个文件恰好存在内容却不对，症状都是难查的 401。
+/// 要用别人的凭据就显式设环境变量，或者写进设置文件。
+pub fn api_key(from_settings: Option<&str>) -> Option<String> {
     if let Ok(key) = std::env::var("AI_API_KEY")
         && !key.trim().is_empty()
     {
@@ -102,22 +103,7 @@ pub fn api_key(endpoint: &str, from_settings: Option<&str>) -> Option<String> {
     {
         return Some(key.trim().to_string());
     }
-    if endpoint.contains("deepseek") {
-        let path = home_dir()?.join(".pi").join("agent").join("auth.json");
-        let text = std::fs::read_to_string(path).ok()?;
-        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-        if let Some(key) = value.get("deepseek")?.get("key")?.as_str() {
-            return Some(key.to_string());
-        }
-    }
     None
-}
-
-/// 用户主目录（找旧凭据文件用）。取不到就算了，不该因此失败。
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
 }
 
 /// 「选中文字 → AI 编辑」的系统提示词。
@@ -273,8 +259,23 @@ fn curl_hint(code: i32) -> &'static str {
 }
 
 /// 从**非流式**响应体里取正文（服务端忽略 `stream` 时的回退路径）。
+///
+/// 失败时把**响应原文**带上：服务端的报错不一定是 JSON —— DeepSeek 没带 Key 时
+/// 回的就是纯文本 `Authentication Fails (governor)`。以前这里直接把它丢给 `serde`，
+/// 用户看到的是一句 `expected value at line 1 column 1` —— 等于没说。
 fn parse_completion_body(bytes: &[u8]) -> Result<String, String> {
-    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    let value: serde_json::Value = match serde_json::from_slice(bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            let text = String::from_utf8_lossy(bytes);
+            let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            return Err(if text.is_empty() {
+                "AI 返回了空响应（端点地址写对了吗？）".to_string()
+            } else {
+                format!("AI 返回的不是 JSON：{}", truncate_chars(&text, 200))
+            });
+        }
+    };
 
     if let Some(err) = value.get("error") {
         let message = err["message"]
@@ -294,6 +295,23 @@ fn parse_completion_body(bytes: &[u8]) -> Result<String, String> {
     }
     Ok(text)
 }
+
+/// 截到 `limit` 个字符（按字符，不按字节 —— 不然中文会被切断在半个字上）。
+fn truncate_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(limit).collect();
+    format!("{head}…")
+}
+
+/// 「在光标处插入内容」模式的补充说明。
+///
+/// 普通编辑的提示词是「给出修改后的完整片段」—— 那句话在插入模式下会被模型
+/// 理解成「把上下文重写一遗」，于是插进去一坨重复内容。所以这条要说清楚：
+/// 上下文只是「你写到哪儿了」的位置参照，回复必须是**新**内容。
+pub const INSERT_HINT: &str = "这一条要求是「在光标处插入新内容」：上面给你的上下文只是光标所在的位置参照，\
+请不要重写、不要重复其中的句子，只输出要**插入**的那一段新内容本身（不要解释、不要代码块）。";
 
 /// 发一轮对话（OpenAI 兼容），支持取消与进度。
 ///
@@ -332,6 +350,13 @@ pub fn chat_messages(
     let auth = key.map(|k| format!("Authorization: Bearer {k}"));
     let data_arg = format!("@{}", body_path.to_string_lossy());
 
+    // 把 HTTP 状态码单独收回来（`-w` 把它追加在响应体后面）。
+    //
+    // 为什么要它：401 / 403 / 429 这些的**响应体**往往是一句人话
+    // （DeepSeek 没带 Key 时就是 `Authentication Fails (governor)`），
+    // 但光有那句话看不出是哪种错；带上状态码就一眼清楚了。
+    // 前缀用一个 SSE 里不可能出现的控制字符，免得跟正文撞车。
+    const STATUS_MARK: &str = "\u{1}http=";
     let mut cmd = std::process::Command::new("curl");
     // `-N` 关掉缓冲，否则 SSE 会攒到最后一次性吐出来（进度就白做了）
     cmd.args(["-s", "-N", "--max-time", "120", "-X", "POST", base_url]);
@@ -340,6 +365,9 @@ pub fn chat_messages(
         cmd.args(["-H", auth.as_str()]);
     }
     cmd.args(["--data-binary", &data_arg]);
+    // 前面那个 `\n` 不能少：curl 的 `-w` 是**紧跟在响应体后面**写的，
+    // 不隔一行的话最后一行会粘成 `...governor}http=401`，状态码就成了正文的一部分。
+    cmd.args(["-w", &format!("\n{STATUS_MARK}%{{http_code}}")]);
     #[cfg(windows)]
     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW：别弹黑框
     cmd.stdout(std::process::Stdio::piped());
@@ -375,9 +403,15 @@ pub fn chat_messages(
         let mut raw: Vec<u8> = Vec::new();
         let mut streamed = String::new();
         let mut generated = 0usize;
+        let mut http_status: Option<String> = None;
 
         for line in reader.lines() {
             let Ok(line) = line else { break };
+            // 状态码那一行是 curl 追加的，不是响应体的一部分
+            if let Some(code) = line.strip_prefix(STATUS_MARK) {
+                http_status = Some(code.trim().to_string());
+                continue;
+            }
             raw.extend_from_slice(line.as_bytes());
             raw.push(b'\n');
             if let Some((content, reasoning)) = parse_sse_delta(&line) {
@@ -393,7 +427,7 @@ pub fn chat_messages(
             }
         }
 
-        (raw, streamed)
+        (raw, streamed, http_status)
     });
     let stderr_thread = std::thread::spawn(move || {
         let mut buf = Vec::new();
@@ -421,7 +455,7 @@ pub fn chat_messages(
         }
     };
 
-    let (raw, streamed) = stdout_thread.join().unwrap_or_default();
+    let (raw, streamed, http_status) = stdout_thread.join().unwrap_or_default();
     let stderr = stderr_thread.join().unwrap_or_default();
     let _ = std::fs::remove_file(&body_path);
 
@@ -429,20 +463,28 @@ pub fn chat_messages(
     if !streamed.trim().is_empty() {
         return Ok(streamed);
     }
+
+    // 错误一律带上 HTTP 状态码（有的话）—— 「到底是没鉴权、限流、还是端点写错了」，
+    // 就靠它一眼分清。
+    let with_status = |why: String| match &http_status {
+        Some(code) if code != "200" && code != "000" => format!("HTTP {code}：{why}"),
+        _ => why,
+    };
+
     if !status.success() {
         let message = String::from_utf8_lossy(&stderr).trim().to_string();
         let code = status.code().unwrap_or(-1);
         let hint = curl_hint(code);
-        return Err(if !message.is_empty() {
+        return Err(with_status(if !message.is_empty() {
             format!("AI 请求失败：{message}")
         } else if hint.is_empty() {
             format!("curl 退出码 {code}")
         } else {
             format!("{hint}（curl {code}）")
-        });
+        }));
     }
 
-    parse_completion_body(&raw)
+    parse_completion_body(&raw).map_err(with_status)
 }
 
 #[cfg(test)]
@@ -548,6 +590,35 @@ mod tests {
         assert_eq!(parse_sse_delta("data: "), None);
         assert_eq!(parse_sse_delta("event: ping"), None, "非 data: 行不管");
         assert_eq!(parse_sse_delta("data: 不是 JSON"), None);
+    }
+
+    #[test]
+    fn the_insert_hint_says_it_is_an_insertion() {
+        // 这句话是提示词里唯一区分「改写」与「插入」的地方，不能删掉关键词
+        assert!(INSERT_HINT.contains("插入"));
+        assert!(INSERT_HINT.contains("不要重写"));
+    }
+
+    #[test]
+    fn a_non_json_body_becomes_a_readable_error() {
+        // DeepSeek 没带 Key 时就是这么回的：一句纯文本，不是 JSON。
+        // 以前这里报的是「expected value at line 1 column 1」—— 等于没说。
+        let err = parse_completion_body(b"Authentication Fails (governor)").unwrap_err();
+        assert!(err.contains("Authentication Fails"), "{err}");
+        assert!(!err.contains("expected value"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_body_says_so_instead_of_a_json_error() {
+        let err = parse_completion_body(b"").unwrap_err();
+        assert!(err.contains("空响应"), "{err}");
+    }
+
+    #[test]
+    fn a_json_error_body_still_reports_the_message() {
+        let body = br#"{"error":{"message":"Invalid API key"}}"#;
+        let err = parse_completion_body(body).unwrap_err();
+        assert_eq!(err, "AI 错误：Invalid API key");
     }
 
     #[test]

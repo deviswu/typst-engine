@@ -1,0 +1,13 @@
+# 项目用哪套工具链：写下来，省得换机器 / 上 CI 时先花半小时查「为什么编译不过」。
+#
+# MSRV 的真正出处是 `Cargo.toml` 的 `rust-version`（本项目是 **1.92**）：
+# edition 2024、`let-chains`（`if let Some(x) = a && cond`）、
+# 以及 unsafe_op_in_unsafe_fn 这些新规则都由它兜底。
+#
+# 这里写 `stable` 是因为本机与 CI 都用最新稳定版（当前 1.98）——
+# 写一个具体版本号反而会让每台机器都去下一份全新的工具链。
+[toolchain]
+channel = "stable"
+# 这两个不是可选装饰：本项目的验收口径含「`cargo fmt --check` 与
+# `clippy -D warnings` 都干净」，缺了组件那条验收就变成跑不了。
+components = ["rustfmt", "clippy"]
