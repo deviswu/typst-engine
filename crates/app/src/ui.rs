@@ -49,6 +49,31 @@ impl Render for Previewer {
             .detach();
         }
 
+        // `--rec-selftest`：等首帧真的画出去（窗口已呈现）再自动开录，到点自己收尾。
+        // 平时走不到这儿。
+        if self.rec_selftest.is_some() && !self.rec_selftest_started && !self.first_compile {
+            self.rec_selftest_started = true;
+            let secs = self.rec_selftest.unwrap_or(5);
+            let weak = cx.entity().downgrade();
+            // 开录要 `&mut Window`，所以推到下一帧用 `defer`（那时窗口一定在）。
+            let opener = weak.clone();
+            window.defer(cx, move |window, cx| {
+                let _ = safe_task_update(&opener, cx, |this, cx| this.start_recording(window, cx));
+            });
+            cx.spawn(async move |_this, cx| {
+                // 中途**暂停 1 秒再继续**：顺带把「分段 + 无损拼接」那条路也走一遍
+                // （它比普通录制多一套记账，不是每一次手点都会碰到）。
+                let half = Duration::from_secs((secs / 2).max(1));
+                cx.background_executor().timer(half).await;
+                let _ = safe_task_update(&weak, cx, |this, cx| this.toggle_record_pause(cx));
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let _ = safe_task_update(&weak, cx, |this, cx| this.toggle_record_pause(cx));
+                cx.background_executor().timer(half).await;
+                let _ = safe_task_update(&weak, cx, |this, cx| this.stop_recording(cx));
+            })
+            .detach();
+        }
+
         // 窗口尺寸/位置变了就记下来（拖动时会变很多次，所以写盘是防抖的）。
         //
         // ★ 用 `window_bounds()` 而不是 `bounds()`：前者就是「下次开窗该用哪份
@@ -203,6 +228,17 @@ impl Render for Previewer {
                     }
                 }
             }
+
+            // 录屏按钮：单独一段（它不属于「插入标记」那几组）。
+            // 录制中变红并显示计时 —— 这个按钮本身也在录像画面里，得一眼看出状态。
+            bar = bar.child(
+                div()
+                    .w(px(1.))
+                    .h(px(22.))
+                    .flex_shrink_0()
+                    .bg(theme.muted_foreground.opacity(0.35)),
+            );
+            bar = bar.child(self.render_record_button(cx));
 
             bar
         };
@@ -408,45 +444,14 @@ impl Render for Previewer {
             .size_full()
             .bg(theme.background)
             .child(self.render_menu(cx))
-            .child(toolbar)
+            .children(self.show_toolbar.then_some(toolbar))
             // 中间三块用可拖动分区：编辑区与展示区的分界**能左右拖**
             // （拖的时候预览会自动按新宽度重排 —— 见 `fit_zoom_to_viewport`）
-            .child(
-                // 注意：`ResizablePanelGroup` 自己的 render 里已经 `size_full +
-                // flex_1 + min_h_0/min_w_0`，所以这里**不要**再调 flex_1（它没有
-                // 实现 Styled，调了也编译不过），直接当 flex 子项放就行。
-                h_resizable("main-split")
-                    .with_state(&self.split_state)
-                    .child(
-                        // 侧栏给个尺寸范围：拖到过窄会把文字挤爆
-                        resizable_panel()
-                            .size(px(180.))
-                            .size_range(px(150.)..px(420.))
-                            .child(sidebar_pane),
-                    )
-                    .child(
-                        // 编辑区：**下限定得比内容最小宽度大**，否则拖到很窄时
-                        // 内容（Input）会溢出到左边的侧栏上，看起来就是「覆盖目录」
-                        // 编辑区 : 展示区 = **1 : 1**（用户要求）：两边等宽，
-                        // 拖过分隔条之后按用户拖的比例走（`ResizableState` 不落盘，
-                        // 所以下次打开又回到 1:1）。
-                        resizable_panel()
-                            .size(px(700.))
-                            .size_range(px(400.)..px(2600.))
-                            .child(editor_pane),
-                    )
-                    .child(
-                        // 展示区与编辑区等宽。预览是「适应宽度」，自己会缩；
-                        // 真嫌小，往左拖分隔条就行。
-                        resizable_panel()
-                            .size(px(700.))
-                            .size_range(px(300.)..px(2600.))
-                            .child(self.render_right_pane(preview_pane, cx)),
-                    ),
-            )
+            // 中间三块：按「视图」菜单里的显隐装进可拖动分区（见 `render_main_area`）。
+            .child(self.render_main_area(sidebar_pane, editor_pane, preview_pane, cx))
             .children(self.shell_visible.then(|| self.render_shell(cx)))
             // 状态栏贴窗口最底：上面是内容，最下面一条是状态
-            .child(self.render_statusbar(cx))
+            .children(self.show_statusbar.then(|| self.render_statusbar(cx)))
             // 浮层放在最后，才能盖在内容之上
             .children((self.ai.stage != AiStage::Closed).then(|| self.render_ai(cx)))
             .children(self.ai_settings_open.then(|| self.render_ai_settings(cx)))
@@ -550,6 +555,15 @@ impl Render for Previewer {
                 let on = !this.autosave;
                 this.set_autosave(on, cx);
             }))
+            // 录屏：开始/停止、暂停/继续。
+            .on_action(cx.listener(|this, _: &ToggleRecording, window, cx| {
+                this.toggle_recording(window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &ToggleRecordPause, _window, cx| {
+                    this.toggle_record_pause(cx)
+                }),
+            )
             // Ctrl + 滚轮缩放。不阻止容器自身的滚动（gpui 没有 preventDefault），
             // 所以缩完之后把当前页重新锚回顶部 —— 一举两得：既抵消了误滚，
             // 又让“缩放不跳位置”成为确定行为。

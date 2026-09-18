@@ -20,79 +20,85 @@ impl Previewer {
         let current_theme: SharedString = self.theme_name.clone().unwrap_or_default().into();
         let recent_dirs: Vec<PathBuf> = self.recent_dirs.clone();
 
-        let file_menu = {
-            let view = view.clone();
-            Button::new("menu-file")
-                .flex_shrink_0()
-                .ghost()
-                .compact()
-                .label("文件")
-                .dropdown_menu(move |menu, window, _cx| {
-                    let view = view.clone();
+        let file_menu =
+            {
+                let view = view.clone();
+                Button::new("menu-file")
+                    .flex_shrink_0()
+                    .ghost()
+                    .compact()
+                    .label("文件")
+                    .dropdown_menu(move |menu, window, _cx| {
+                        let view = view.clone();
 
-                    // 最近文件夹：`PopupMenuItem` 是菜单项不是元素，既不能
-                    // `.children(...)` 也不能 `.into_any_element()`，只能 for 循环塞。
-                    // 建在这里是因为 `window` 只在闭包里有。
-                    let mut recent_items: Vec<PopupMenuItem> =
-                        vec![PopupMenuItem::new("（还没有）").disabled(true)];
-                    if !recent_dirs.is_empty() {
-                        recent_items = recent_dirs
-                            .iter()
-                            .enumerate()
-                            .map(|(index, dir)| {
-                                let label = short_path(&dir.to_string_lossy());
-                                PopupMenuItem::new(label).on_click(window.listener_for(
-                                    &view,
-                                    move |this, _, _window, cx| {
-                                        this.use_recent_dir(index, cx);
-                                    },
+                        // 最近文件夹：`PopupMenuItem` 是菜单项不是元素，既不能
+                        // `.children(...)` 也不能 `.into_any_element()`，只能 for 循环塞。
+                        // 建在这里是因为 `window` 只在闭包里有。
+                        let mut recent_items: Vec<PopupMenuItem> =
+                            vec![PopupMenuItem::new("（还没有）").disabled(true)];
+                        if !recent_dirs.is_empty() {
+                            recent_items = recent_dirs
+                                .iter()
+                                .enumerate()
+                                .map(|(index, dir)| {
+                                    let label = short_path(&dir.to_string_lossy());
+                                    PopupMenuItem::new(label).on_click(window.listener_for(
+                                        &view,
+                                        move |this, _, _window, cx| {
+                                            this.use_recent_dir(index, cx);
+                                        },
+                                    ))
+                                })
+                                .collect();
+                        }
+
+                        let mut menu =
+                            menu.min_w(220.)
+                                .item(PopupMenuItem::new("保存（Ctrl+S）").on_click(
+                                    window.listener_for(&view, |this, _, _window, cx| {
+                                        this.save_file(cx);
+                                    }),
                                 ))
-                            })
-                            .collect();
-                    }
-
-                    let mut menu =
-                        menu.min_w(220.)
-                            .item(PopupMenuItem::new("保存（Ctrl+S）").on_click(
-                                window.listener_for(&view, |this, _, _window, cx| {
-                                    this.save_file(cx);
-                                }),
-                            ))
-                            .item(PopupMenuItem::new("重新编译（Ctrl+B）").on_click(
-                                window.listener_for(&view, |this, _, _window, cx| {
-                                    this.recompile_now(cx);
-                                }),
-                            ))
-                            .item(PopupMenuItem::new("导出 PDF（Ctrl+E）").on_click(
-                                window.listener_for(&view, |this, _, _window, cx| {
-                                    this.export_pdf(cx);
+                                .item(PopupMenuItem::new("重新编译（Ctrl+B）").on_click(
+                                    window.listener_for(&view, |this, _, _window, cx| {
+                                        this.recompile_now(cx);
+                                    }),
+                                ))
+                                .item(PopupMenuItem::new("导出 PDF（Ctrl+E）").on_click(
+                                    window.listener_for(&view, |this, _, _window, cx| {
+                                        this.export_pdf(cx);
+                                    }),
+                                ))
+                                .separator()
+                                .item(PopupMenuItem::new("打开文件夹…").on_click(
+                                    window.listener_for(&view, |this, _, _window, cx| {
+                                        this.open_folder_picker(cx);
+                                    }),
+                                ))
+                                .item(PopupMenuItem::new("最近文件夹").disabled(true));
+                        for item in recent_items {
+                            menu = menu.item(item);
+                        }
+                        menu = menu
+                            .separator()
+                            .item(PopupMenuItem::new("AI 编辑…（Ctrl+K）").on_click(
+                                window.listener_for(&view, |this, _, window, cx| {
+                                    this.open_ai(window, cx);
                                 }),
                             ))
                             .separator()
-                            .item(
-                                PopupMenuItem::new("打开文件夹…").on_click(window.listener_for(
-                                    &view,
-                                    |this, _, _window, cx| {
-                                        this.open_folder_picker(cx);
-                                    },
-                                )),
-                            )
-                            .item(PopupMenuItem::new("最近文件夹").disabled(true));
-                    for item in recent_items {
-                        menu = menu.item(item);
-                    }
-                    menu = menu
-                        .separator()
-                        .item(PopupMenuItem::new("AI 编辑…（Ctrl+K）").on_click(
-                            window.listener_for(&view, |this, _, window, cx| {
-                                this.open_ai(window, cx);
-                            }),
-                        ))
-                        .separator()
-                        .item(PopupMenuItem::new("退出").on_click(|_, _, cx: &mut App| cx.quit()));
-                    menu
-                })
-        };
+                            .item(PopupMenuItem::new("退出").on_click(window.listener_for(
+                                &view,
+                                |this, _, _window, cx| {
+                                    // 录着的时候点退出：先把录像收干净（同步收尾），
+                                    // 不能把用户刚录的丢在分段文件里。
+                                    this.finish_recording_on_close();
+                                    cx.quit();
+                                },
+                            )));
+                        menu
+                    })
+            };
 
         // 「主题」菜单：**只放主题列表**。
         //
@@ -193,6 +199,129 @@ impl Previewer {
                 })
         };
 
+        // 「视图」菜单：面板/栏的显隐 + 录屏。
+        //
+        // 它是为录屏回来的（L20 那次按用户要求删掉了）：录出来的画面**就是窗口本身**，
+        // 所以「要录干净画面」只能靠把不想入镜的那些关掉。菜单条本身留着不关 ——
+        // 全关掉之后总得有地方能开回来。
+        let view_menu = {
+            let view = view.clone();
+            let (tree, editor, preview, toolbar, statusbar) = (
+                self.show_tree,
+                self.show_editor,
+                self.show_preview,
+                self.show_toolbar,
+                self.show_statusbar,
+            );
+            let (mic, cam) = (self.rec_mic, self.rec_cam);
+            let recording = self.rec.is_some();
+            let paused = matches!(
+                self.rec.as_ref().map(|r| r.state()),
+                Some(record::State::Paused)
+            );
+            let finalizing = self.rec_finalizing;
+
+            Button::new("menu-view")
+                .flex_shrink_0()
+                .ghost()
+                .compact()
+                .label("视图")
+                .dropdown_menu(move |menu, window, _cx| {
+                    let view = view.clone();
+                    let mut menu = menu.min_w(260.);
+
+                    // 五个显隐。`.checked()` 抓住的是「打开菜单那一刻的值」——
+                    // 菜单条每次 render 都会重建这批闭包，所以不会过期。
+                    menu = menu
+                        .item(
+                            PopupMenuItem::new("显示目录（左栏）")
+                                .checked(tree)
+                                .on_click(window.listener_for(
+                                    &view,
+                                    move |this, _, _window, cx| {
+                                        this.set_pane_visible(PaneToggle::Tree, !tree, cx);
+                                    },
+                                )),
+                        )
+                        .item(PopupMenuItem::new("显示编辑区").checked(editor).on_click(
+                            window.listener_for(&view, move |this, _, _window, cx| {
+                                this.set_pane_visible(PaneToggle::Editor, !editor, cx);
+                            }),
+                        ))
+                        .item(PopupMenuItem::new("显示展示区").checked(preview).on_click(
+                            window.listener_for(&view, move |this, _, _window, cx| {
+                                this.set_pane_visible(PaneToggle::Preview, !preview, cx);
+                            }),
+                        ))
+                        .item(PopupMenuItem::new("显示工具栏").checked(toolbar).on_click(
+                            window.listener_for(&view, move |this, _, _window, cx| {
+                                this.set_pane_visible(PaneToggle::Toolbar, !toolbar, cx);
+                            }),
+                        ))
+                        .item(
+                            PopupMenuItem::new("显示状态栏")
+                                .checked(statusbar)
+                                .on_click(window.listener_for(
+                                    &view,
+                                    move |this, _, _window, cx| {
+                                        this.set_pane_visible(
+                                            PaneToggle::Statusbar,
+                                            !statusbar,
+                                            cx,
+                                        );
+                                    },
+                                )),
+                        )
+                        .separator()
+                        .item(
+                            PopupMenuItem::new(if recording {
+                                "停止录屏（Ctrl+Alt+R）"
+                            } else {
+                                "开始录屏（Ctrl+Alt+R）"
+                            })
+                            .on_click(window.listener_for(
+                                &view,
+                                |this, _, window, cx| {
+                                    this.toggle_recording(window, cx);
+                                },
+                            )),
+                        );
+
+                    if recording {
+                        menu = menu.item(
+                            PopupMenuItem::new(if paused {
+                                "继续录（Ctrl+Alt+P）"
+                            } else {
+                                "暂停录（Ctrl+Alt+P）"
+                            })
+                            .on_click(window.listener_for(
+                                &view,
+                                |this, _, _window, cx| {
+                                    this.toggle_record_pause(cx);
+                                },
+                            )),
+                        );
+                    }
+                    if finalizing {
+                        menu =
+                            menu.item(PopupMenuItem::new("收尾中…（拼接 / 合成）").disabled(true));
+                    }
+
+                    menu.item(PopupMenuItem::new("录麦克风").checked(mic).on_click(
+                        window.listener_for(&view, move |this, _, _window, cx| {
+                            this.set_record_mic(!mic, cx)
+                        }),
+                    ))
+                    .item(
+                        PopupMenuItem::new("录摄像头画中画").checked(cam).on_click(
+                            window.listener_for(&view, move |this, _, _window, cx| {
+                                this.set_record_cam(!cam, cx)
+                            }),
+                        ),
+                    )
+                })
+        };
+
         h_flex()
             .w_full()
             .flex_shrink_0()
@@ -204,6 +333,7 @@ impl Previewer {
             .child(file_menu)
             .child(theme_menu)
             .child(ai_menu)
+            .child(view_menu)
             .child(
                 div()
                     .ml_auto()
@@ -212,6 +342,138 @@ impl Previewer {
                     .child(self.main_path.display().to_string()),
             )
     }
+    /// 工具栏上的录屏按钮：空闲是「录屏」，录制中变红带计时，收尾中变字。
+    ///
+    /// 这个按钮**本身也会被录进画面** —— 所以它得一眼看得出「正在录」，
+    /// 不能只靠状态栏那行小字。
+    pub(crate) fn render_record_button(&self, cx: &Context<Self>) -> impl IntoElement {
+        let recording = self.rec.is_some();
+        let paused = matches!(
+            self.rec.as_ref().map(|r| r.state()),
+            Some(record::State::Paused)
+        );
+        let (label, hint) = if self.rec_finalizing {
+            (
+                "收尾中…".to_string(),
+                "正在拼接 / 合成，完了状态栏会说存到哪",
+            )
+        } else if recording {
+            (
+                format!(
+                    "⏺ {} 停止",
+                    record::elapsed_label(self.rec_elapsed.as_secs())
+                ),
+                "停止录屏（Ctrl+Alt+R）",
+            )
+        } else {
+            (
+                "录屏".to_string(),
+                "录屏（Ctrl+Alt+R）：只录本软件窗口那一块 + 麦克风",
+            )
+        };
+
+        let button = if recording {
+            Button::new("tb-record")
+                .flex_shrink_0()
+                .danger()
+                .xsmall()
+                .label(label)
+        } else {
+            Button::new("tb-record")
+                .flex_shrink_0()
+                .ghost()
+                .xsmall()
+                .label(label)
+        }
+        .tooltip(hint)
+        .on_click(cx.listener(|this, _, window, cx| this.toggle_recording(window, cx)));
+
+        let mut row = h_flex()
+            .flex_shrink_0()
+            .gap_2()
+            .items_center()
+            .child(button);
+        // 暂停/继续只在录制中出现（平时不占工具栏）
+        if recording {
+            row = row.child(
+                Button::new("tb-record-pause")
+                    .flex_shrink_0()
+                    .ghost()
+                    .xsmall()
+                    .label(if paused { "▶ 继续" } else { "⏸ 暂停" })
+                    .tooltip("暂停 / 继续（Ctrl+Alt+P）：暂停是把这一段收干净，继续时接着录")
+                    .on_click(cx.listener(|this, _, _window, cx| this.toggle_record_pause(cx))),
+            );
+        }
+        row
+    }
+
+    /// 中间那三块：按「视图」菜单里的显隐装进可拖动分区。
+    ///
+    /// 隐藏 = **不装进去**（而不是把宽度设 0）：这样分隔条也不会留下，只留一块时
+    /// 它自己占满 —— `ResizableState::sync_panels_count` 本来就有「面板数量变了」
+    /// 的分支，会按容器重新分配尺寸。
+    pub(crate) fn render_main_area(
+        &self,
+        sidebar: impl IntoElement,
+        editor: impl IntoElement,
+        preview: impl IntoElement,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+
+        // 三块都关了：给一句话，不然一片空白看起来就是卡死了
+        if !self.show_tree && !self.show_editor && !self.show_preview {
+            return v_flex()
+                .flex_1()
+                .h_full()
+                .items_center()
+                .justify_center()
+                .bg(theme.secondary)
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child("三块面板都隐藏了 —— 从「视图」菜单里把它们打开")
+                .into_any_element();
+        }
+
+        let mut panels: Vec<gpui_component::resizable::ResizablePanel> = Vec::new();
+        if self.show_tree {
+            // 侧栏给个尺寸范围：拖到过窄会把文字挤爆
+            panels.push(
+                resizable_panel()
+                    .size(px(180.))
+                    .size_range(px(150.)..px(420.))
+                    .child(sidebar),
+            );
+        }
+        if self.show_editor {
+            // 编辑区：**下限定得比内容最小宽度大**，否则拖到很窄时内容（Input）
+            // 会溢出到左边的侧栏上，看起来就是「覆盖目录」。
+            panels.push(
+                resizable_panel()
+                    .size(px(700.))
+                    .size_range(px(400.)..px(2600.))
+                    .child(editor),
+            );
+        }
+        if self.show_preview {
+            panels.push(
+                resizable_panel()
+                    .size(px(700.))
+                    .size_range(px(300.)..px(2600.))
+                    .child(self.render_right_pane(preview.into_any_element(), cx)),
+            );
+        }
+
+        // 注意：`ResizablePanelGroup` 自己的 render 里已经 `size_full + flex_1 +
+        // min_h_0/min_w_0`，所以这里**不要**再调 flex_1（它没有实现 Styled，
+        // 调了也编译不过），直接当 flex 子项放就行。
+        h_resizable("main-split")
+            .with_state(&self.split_state)
+            .children(panels)
+            .into_any_element()
+    }
+
     /// 底部状态栏：**一行**装下引擎指标 + 文档统计 + 保存/错误 + 一次性消息 + 主题。
     ///
     /// 放在窗口最底部（终端面板之下）—— 与大多数编辑器一致：

@@ -70,6 +70,18 @@ pub struct Settings {
     /// 只对「用户显式打开的文件」生效 —— 内置示例文档永远不写盘，那条守卫
     /// 与这个开关无关（见 `autosave::should_save`）。
     pub autosave: Option<bool>,
+    /// 三块面板与两条栏的显隐（默认都显示，所以「没这项」= 开）。
+    ///
+    /// 录出来的画面**就是窗口本身** —— 所以「要干净画面」= 从「视图」菜单
+    /// 把不想入镜的那些关掉，不需要另外做什么「录屏模式」。
+    pub show_tree: Option<bool>,
+    pub show_editor: Option<bool>,
+    pub show_preview: Option<bool>,
+    pub show_toolbar: Option<bool>,
+    pub show_statusbar: Option<bool>,
+    /// 录屏时录麦克风 / 录摄像头画中画（默认都开）。
+    pub record_mic: Option<bool>,
+    pub record_cam: Option<bool>,
     /// 最近用过的文件夹（目录树根），按最近使用排序。
     ///
     /// 一条一行（`recent_dir=...`）而不是拼成一行 —— 路径里可能有任何字符，
@@ -148,6 +160,13 @@ impl Settings {
                 "folding" => out.folding = value.parse::<bool>().ok(),
                 "show_metrics" => out.show_metrics = value.parse::<bool>().ok(),
                 "autosave" => out.autosave = value.parse::<bool>().ok(),
+                "show_tree" => out.show_tree = value.parse::<bool>().ok(),
+                "show_editor" => out.show_editor = value.parse::<bool>().ok(),
+                "show_preview" => out.show_preview = value.parse::<bool>().ok(),
+                "show_toolbar" => out.show_toolbar = value.parse::<bool>().ok(),
+                "show_statusbar" => out.show_statusbar = value.parse::<bool>().ok(),
+                "record_mic" => out.record_mic = value.parse::<bool>().ok(),
+                "record_cam" => out.record_cam = value.parse::<bool>().ok(),
                 // 最近文件夹是多行：每行一条，读进来就往后排
                 "recent_dir" if !value.is_empty() => {
                     if out.recent_dirs.len() < super::MAX_RECENT_DIRS {
@@ -195,6 +214,19 @@ impl Settings {
         if let Some(on) = self.autosave {
             out.push_str(&format!("autosave={on}\n"));
         }
+        for (key, on) in [
+            ("show_tree", self.show_tree),
+            ("show_editor", self.show_editor),
+            ("show_preview", self.show_preview),
+            ("show_toolbar", self.show_toolbar),
+            ("show_statusbar", self.show_statusbar),
+            ("record_mic", self.record_mic),
+            ("record_cam", self.record_cam),
+        ] {
+            if let Some(on) = on {
+                out.push_str(&format!("{key}={on}\n"));
+            }
+        }
         for dir in self.recent_dirs.iter().take(super::MAX_RECENT_DIRS) {
             out.push_str(&format!("recent_dir={}\n", dir.display()));
         }
@@ -240,6 +272,13 @@ mod tests {
             folding: Some(false),
             show_metrics: Some(true),
             autosave: Some(false),
+            show_tree: Some(false),
+            show_editor: Some(true),
+            show_preview: Some(true),
+            show_toolbar: Some(false),
+            show_statusbar: Some(true),
+            record_mic: Some(false),
+            record_cam: Some(true),
             recent_dirs: vec![
                 PathBuf::from("D:/工作/钻头型号排名"),
                 PathBuf::from("C:/Users/admin/文档"),

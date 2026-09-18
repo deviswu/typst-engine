@@ -62,6 +62,20 @@ serde_json = "1"
 # AI 改稿应用前的行级 diff（wu 用的同一个 crate）
 similar = "2"
 
+# 录屏：要拿窗口的**物理**矩形交给 ffmpeg 的 gdigrab。
+#
+# - `raw-window-handle`：gpui 的 `Window` 实现了 `HasWindowHandle`，从这里拿 HWND
+#   （gpui 自己也用 0.6，所以版本必须对齐，不然 trait 对不上）。
+# - `windows-sys`：`GetWindowRect` / `MonitorFromWindow` / `GetLocalTime` 三个查询。
+#   两个 crate 都**已经在 Cargo.lock 里**（gpui 传递引入），所以不产生新下载。
+raw-window-handle = "0.6"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_SystemInformation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 # 编辑器能力：补全（CompletionProvider）与底色标记（DocumentColorProvider）
 # 都定义在 gpui-component 的 input::lsp 里，它们的签名用的是这两个 crate 的类型
 # —— 版本必须与 gpui-component 的 workspace 一致，否则 trait 对不上。

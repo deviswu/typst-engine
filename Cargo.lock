@@ -8290,6 +8290,7 @@ dependencies = [
  "gpui_platform",
  "image",
  "lsp-types",
+ "raw-window-handle",
  "ropey",
  "serde",
  "serde_json",
@@ -8298,6 +8299,7 @@ dependencies = [
  "typst",
  "typst-engine",
  "typst-layout",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

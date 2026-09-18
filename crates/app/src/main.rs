@@ -26,7 +26,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
@@ -91,6 +91,7 @@ mod jump_glue;
 mod markdown_view;
 mod markup;
 mod preview;
+mod record;
 mod safe_update;
 mod settings;
 mod term_colors;
@@ -128,12 +129,17 @@ actions!(
         TogglePreviewBg,
         ToggleMetrics,
         ToggleAutosave,
+        ToggleRecording,
+        ToggleRecordPause,
     ]
 );
 
 const ZOOM_MIN: f32 = 0.25;
 const ZOOM_MAX: f32 = 4.0;
 const ZOOM_STEP: f32 = 1.25;
+
+/// 录屏轮询间隔：刷按钮上的计时 + 看 ffmpeg 是不是偷偷退了。
+const REC_POLL: Duration = Duration::from_secs(1);
 
 /// 设置写盘前的等待时长。
 ///
@@ -250,6 +256,19 @@ struct Status {
     compiles: usize,
     /// 光栅化次数。缩放**会**让它增加。
     rasters: usize,
+}
+
+/// 「视图」菜单里的显隐开关。
+///
+/// 用一个枚举而不是 5 个 action：菜单项要做的就是「取当前值取反」这一件事，
+/// 拆成 5 个 action 只是把同一段代码抄 5 遍。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneToggle {
+    Tree,
+    Editor,
+    Preview,
+    Toolbar,
+    Statusbar,
 }
 
 /// AI 编辑的当前阶段（一个状态机，界面上只画一个浮层，内容随阶段变）。
@@ -657,6 +676,33 @@ struct Previewer {
     terminal_ime: Entity<terminal_view::ImeState>,
     /// 终端面板是否可见（Ctrl+4 切换）
     shell_visible: bool,
+    /// 三块面板与两条栏的显隐（「视图」菜单里勾）。
+    ///
+    /// 录出来的画面**就是窗口本身** —— 所以「要录出干净画面」= 把这些关掉，
+    /// 不需要另外做一个「录屏模式」。
+    show_tree: bool,
+    show_editor: bool,
+    show_preview: bool,
+    show_toolbar: bool,
+    show_statusbar: bool,
+    /// 正在录的那一份（`None` = 没在录）。
+    rec: Option<record::Recorder>,
+    /// 录制时长（每秒刷一次，给按钮上的计时）。
+    rec_elapsed: Duration,
+    /// 收尾（拼接 / 画中画合成）正在后台跑。
+    rec_finalizing: bool,
+    /// 录屏轮询任务起了没有（只允许一个，与 `disk_polling` 一个路子）。
+    rec_polling: bool,
+    /// 录屏时录麦克风 / 录摄像头画中画。
+    rec_mic: bool,
+    rec_cam: bool,
+    /// 设备名缓存（第一次录时才枚举一次 dshow）。
+    rec_mic_device: Option<String>,
+    rec_cam_device: Option<String>,
+    /// `--rec-selftest`：要录多少秒（`Some` = 正在自测）。
+    rec_selftest: Option<u64>,
+    /// 自测已经开过录没有（免得每帧都去开一次）。
+    rec_selftest_started: bool,
     /// 主题名（「视图 → 主题」里勾选的那一个）。
     /// 状态栏那个下拉框已经搬进菜单，所以这里只留名字。
     /// 本文档定义的名字（`#let` / `#import`）—— 补全候选的一路来源。
@@ -888,6 +934,19 @@ impl Previewer {
         let show_metrics = settings.show_metrics.unwrap_or(false);
         // 自动保存：默认**开**（用户要求）。老设置文件里没这项 → 也是开。
         let autosave = settings.autosave.unwrap_or(true);
+        // 面板/栏的显隐：默认都显示（老设置文件里没这几项）。
+        let show_tree = settings.show_tree.unwrap_or(true);
+        let show_editor = settings.show_editor.unwrap_or(true);
+        let show_preview = settings.show_preview.unwrap_or(true);
+        let show_toolbar = settings.show_toolbar.unwrap_or(true);
+        let show_statusbar = settings.show_statusbar.unwrap_or(true);
+        // 录屏：默认录麦克风 + 录摄像头画中画（都是用户点名要的能力）。
+        let rec_mic = settings.record_mic.unwrap_or(true);
+        let rec_cam = settings.record_cam.unwrap_or(true);
+        let rec_selftest = match REC_SELFTEST.load(Ordering::Relaxed) {
+            0 => None,
+            secs => Some(secs),
+        };
 
         let this = Self {
             engine,
@@ -961,6 +1020,21 @@ impl Previewer {
             terminal_ime,
             // 终端默认收起：它是「按需叫出来」的东西，一开窗就占半屏反而吵
             shell_visible: false,
+            show_tree,
+            show_editor,
+            show_preview,
+            show_toolbar,
+            show_statusbar,
+            rec: None,
+            rec_elapsed: Duration::ZERO,
+            rec_finalizing: false,
+            rec_polling: false,
+            rec_mic,
+            rec_cam,
+            rec_mic_device: None,
+            rec_cam_device: None,
+            rec_selftest,
+            rec_selftest_started: false,
             theme_name,
             local_defs,
             marks,
@@ -1234,6 +1308,13 @@ impl Previewer {
         next.folding = Some(self.folding);
         next.show_metrics = Some(self.show_metrics);
         next.autosave = Some(self.autosave);
+        next.show_tree = Some(self.show_tree);
+        next.show_editor = Some(self.show_editor);
+        next.show_preview = Some(self.show_preview);
+        next.show_toolbar = Some(self.show_toolbar);
+        next.show_statusbar = Some(self.show_statusbar);
+        next.record_mic = Some(self.rec_mic);
+        next.record_cam = Some(self.rec_cam);
         next.recent_dirs = self.recent_dirs.clone();
         // AI 三项：从 `ai_cfg`（当前想要值）而不是 `settings`（磁盘上那一份）取 ——
         // 否则 `save_settings` 里那句「比一比」永远相等，填的 Key 永远不落盘。
@@ -1654,6 +1735,8 @@ impl Previewer {
             // 的那两条路径（保存并关闭 / 放弃改动）置位。否则「没改动 → 放行」这一
             // 次如果因为别的原因没真的关掉，用户接着又改了东西，下一次关窗就会被
             // 这一位直接放行 —— 那正是这个钩子要防的事。
+            // 关窗前先把录像收干净（同步收尾 —— 见 `finish_recording_on_close`）
+            self.finish_recording_on_close();
             self.shutdown_terminal();
             return true;
         }
@@ -1725,6 +1808,266 @@ impl Previewer {
             self.terminal_focus.focus(window, cx);
         }
         cx.notify();
+    }
+
+    // ------------------------------------------------------------------
+    // 录屏
+    // ------------------------------------------------------------------
+
+    /// 「视图」菜单里的显隐开关。
+    fn set_pane_visible(&mut self, which: PaneToggle, on: bool, cx: &mut Context<Self>) {
+        match which {
+            PaneToggle::Tree => self.show_tree = on,
+            PaneToggle::Editor => self.show_editor = on,
+            PaneToggle::Preview => self.show_preview = on,
+            PaneToggle::Toolbar => self.show_toolbar = on,
+            PaneToggle::Statusbar => self.show_statusbar = on,
+        }
+        logln!("[typst-live] 显隐：{which:?} → {on}");
+        self.touch_settings(cx);
+        cx.notify();
+    }
+
+    fn set_record_mic(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.rec_mic = on;
+        self.touch_settings(cx);
+        cx.notify();
+    }
+
+    fn set_record_cam(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.rec_cam = on;
+        self.touch_settings(cx);
+        cx.notify();
+    }
+
+    /// 开始 / 停止。工具栏按钮、菜单项、快捷键都走这里。
+    fn toggle_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rec.is_some() {
+            self.stop_recording(cx);
+        } else {
+            self.start_recording(window, cx);
+        }
+    }
+
+    fn start_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rec_finalizing {
+            self.message = Some("上一段的收尾还在跑，等它完".into());
+            cx.notify();
+            return;
+        }
+        let region = match self.capture_region(window) {
+            Ok(region) => region,
+            Err(why) => {
+                self.message = Some(why);
+                cx.notify();
+                return;
+            }
+        };
+
+        // 设备名枚举一次就缓存：枚举要起一个 ffmpeg（几百毫秒），不能每秒都来一遍。
+        if self.rec_mic_device.is_none() || self.rec_cam_device.is_none() {
+            let devices = record::list_devices();
+            self.rec_mic_device = devices.audio.first().cloned();
+            self.rec_cam_device = devices.video.first().cloned();
+        }
+        let mic = if self.rec_mic {
+            self.rec_mic_device.clone()
+        } else {
+            None
+        };
+        let cam = if self.rec_cam {
+            self.rec_cam_device.clone()
+        } else {
+            None
+        };
+
+        let (dir, dir_note) = record::out_dir();
+        match record::Recorder::start(&dir, region, mic.clone(), cam.clone(), record::FPS) {
+            Ok(rec) => {
+                self.rec_elapsed = Duration::ZERO;
+                self.rec = Some(rec);
+                self.message = Some(
+                    match (dir_note, mic.is_none(), cam.is_none() && self.rec_cam) {
+                        (Some(note), ..) => note,
+                        (None, true, _) => "录制中（没找到麦克风设备 → 只有画面）".into(),
+                        (None, _, true) => "录制中（没找到摄像头设备 → 没有画中画）".into(),
+                        _ => "录制中".into(),
+                    },
+                );
+                logln!(
+                    "[typst-live] 开始录屏：区域 {}x{} @({}, {}) → {}",
+                    region.w,
+                    region.h,
+                    region.x,
+                    region.y,
+                    dir.display()
+                );
+                self.spawn_rec_poll(cx);
+            }
+            Err(err) => self.message = Some(format!("录不了：{err}")),
+        }
+        // 自测里起不来就别挂着：把原因打出来退出，不然一条命令就卡在那儿了。
+        if self.rec.is_none() && self.rec_selftest.is_some() {
+            let text = self.message.clone().unwrap_or_else(|| "没起来".into());
+            self.selftest_report(&text, cx);
+        }
+        cx.notify();
+    }
+
+    /// 窗口矩形 → 采集区域。所有「这块屏 / 这个窗口行不行」的判断都在这里。
+    fn capture_region(&self, window: &Window) -> Result<record::Rect, String> {
+        let hwnd = record::hwnd_of(window).ok_or("拿不到窗口句柄，这次录不了")?;
+        let (monitor, primary) =
+            record::monitor_rect(hwnd).ok_or("问不出显示器范围，这次录不了")?;
+        if !primary {
+            return Err("录屏只支持主显示器（gdigrab 的桌面以主屏左上角为原点）".into());
+        }
+        let win = record::window_rect(hwnd).ok_or("量不出窗口大小，这次录不了")?;
+        record::crop_region(win, monitor, record::MIN_SIDE).ok_or_else(|| {
+            format!(
+                "窗口太小 / 露出屏幕太少（{}x{}），至少 {}x{} 才录",
+                win.w,
+                win.h,
+                record::MIN_SIDE,
+                record::MIN_SIDE
+            )
+        })
+    }
+
+    fn stop_recording(&mut self, cx: &mut Context<Self>) {
+        let Some(mut rec) = self.rec.take() else {
+            return;
+        };
+        self.rec_elapsed = rec.elapsed();
+        match rec.stop() {
+            Ok(plan) => {
+                // 拼接 / 合成可能要几秒到几十秒（画中画那一步要重编码）——放后台，
+                // 界面上继续能干活。
+                self.rec_finalizing = true;
+                self.message = Some("收尾中（拼接 / 画中画合成）…".into());
+                let weak = cx.entity().downgrade();
+                cx.spawn(async move |_this, cx| {
+                    let done = cx
+                        .background_executor()
+                        .spawn(async move { plan.run() })
+                        .await;
+                    let _ = safe_task_update(&weak, cx, |this, cx| this.on_finalize_done(done, cx));
+                })
+                .detach();
+            }
+            Err(err) => {
+                self.rec_finalizing = false;
+                self.message = Some(format!("收尾失败：{err}"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn on_finalize_done(&mut self, done: Result<record::Done, String>, cx: &mut Context<Self>) {
+        self.rec_finalizing = false;
+        self.message = Some(match done {
+            Ok(done) => {
+                let mut text = format!("已保存 {}", done.path.display());
+                for note in done.notes {
+                    text.push_str(&format!("（{note}）"));
+                }
+                logln!("[typst-live] {text}");
+                text
+            }
+            Err(err) => format!("收尾失败：{err}"),
+        });
+        if let Some(text) = self.message.clone() {
+            self.selftest_report(&text, cx);
+        }
+        cx.notify();
+    }
+
+    /// `--rec-selftest` 的收尾：打印一句然后退出（不在自测里就什么都不做）。
+    fn selftest_report(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.rec_selftest.take().is_none() {
+            return;
+        }
+        println!("[rec-selftest] {text}");
+        cx.quit();
+    }
+
+    /// 暂停 / 继续。
+    fn toggle_record_pause(&mut self, cx: &mut Context<Self>) {
+        let Some(rec) = self.rec.as_mut() else {
+            return;
+        };
+        let outcome = match rec.state() {
+            record::State::Recording => rec.pause(),
+            record::State::Paused => rec.resume(record::FPS),
+            record::State::Finalizing | record::State::Idle => Ok(()),
+        };
+        // 暂停是真的「把这一段收掉了」：继续时开新的一段，停止时按段拼接，
+        // 所以暂停处不会在成品里变成一个洞。
+        self.message = Some(match outcome {
+            Ok(()) if rec.state() == record::State::Paused => {
+                "已暂停（继续时接着录，拼接处不留洞）".into()
+            }
+            Ok(()) => "录制中".into(),
+            Err(err) => format!("暂停 / 继续失败：{err}"),
+        });
+        cx.notify();
+    }
+
+    /// 每秒一拍：刷计时 + 看 ffmpeg 是不是偷偷退了。
+    fn spawn_rec_poll(&mut self, cx: &mut Context<Self>) {
+        if self.rec_polling {
+            return;
+        }
+        self.rec_polling = true;
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_this, cx| {
+            loop {
+                cx.background_executor().timer(REC_POLL).await;
+                let outcome = safe_task_update(&weak, cx, |this, cx| {
+                    let rec = this.rec.as_mut()?;
+                    let fresh = rec.tick();
+                    let elapsed = rec.elapsed();
+                    let changed = elapsed != this.rec_elapsed;
+                    this.rec_elapsed = elapsed;
+                    if fresh.is_some() || changed {
+                        cx.notify();
+                    }
+                    fresh
+                });
+                match outcome {
+                    UpdateOutcome::Done(Some(note)) => {
+                        let _ = safe_task_update(&weak, cx, |this, cx| {
+                            this.message = Some(note);
+                            cx.notify();
+                        });
+                    }
+                    UpdateOutcome::Done(None) | UpdateOutcome::Busy => {}
+                    UpdateOutcome::Gone => break,
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 关窗前把录像收干净（**同步**跑完收尾）。
+    ///
+    /// 为什么不丢给后台执行器：任务会随进程一起消失，而用户完全可能刚录完就关窗 ——
+    /// 那时只给他一堆分段文件就是丢东西。这里卡的只是「关窗」这一步，界面本来就要
+    /// 没了，卡一下比丢录像强（没开画中画时通常就是一次 rename，瞬时）。
+    fn finish_recording_on_close(&mut self) {
+        let Some(mut rec) = self.rec.take() else {
+            return;
+        };
+        match rec.stop() {
+            Ok(plan) => match plan.run() {
+                Ok(done) => logln!("[typst-live] 关窗前收尾完成：{}", done.path.display()),
+                Err(err) => logln!(
+                    "[typst-live] 关窗前收尾失败：{err}（分段文件留在 {}）",
+                    rec.work_dir().display()
+                ),
+            },
+            Err(err) => logln!("[typst-live] 关窗前停止录制失败：{err}"),
+        }
     }
 
     /// 状态栏要不要显示性能指标（排版/光栅化/重解析/纹理……）。
@@ -3142,11 +3485,28 @@ fn ai_selftest(insert: bool) -> i32 {
     }
 }
 
+/// `--rec-selftest` 要录多少秒（0 = 不是自测）。
+static REC_SELFTEST: AtomicU64 = AtomicU64::new(0);
+
 fn main() {
     // 崩溃也要留痕：发布版是 GUI 子系统，stderr 没人接得住（见 `diag` 模块）。
     diag::install_panic_hook();
 
-    let path_arg = std::env::args().nth(1);
+    let mut path_arg = std::env::args().nth(1);
+
+    // `--rec-selftest [秒数]`：开窗 → 自动录一段带声音的 → 收尾 → 打印成品路径并退出。
+    //
+    // 录屏这条链路全是平台行为（ffmpeg 子进程 + dshow 设备名 + gdigrab 的物理坐标 +
+    // 窗口句柄），单测覆盖不到；留一条一行命令的端到端验证，以后回归不用靠手点。
+    // 它**必须开窗**（采集区域来自窗口本身），所以不能像 `--ai-selftest` 那样早退。
+    if path_arg.as_deref() == Some("--rec-selftest") {
+        let secs = std::env::args()
+            .nth(2)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(5);
+        REC_SELFTEST.store(secs, Ordering::Relaxed);
+        path_arg = None;
+    }
 
     // `--ai-selftest`：不开窗，真发一次最小的请求，把结果打在终端上。
     //
@@ -3202,6 +3562,9 @@ fn main() {
             KeyBinding::new("ctrl-alt-g", TogglePreviewBg, None),
             KeyBinding::new("ctrl-alt-m", ToggleMetrics, None),
             KeyBinding::new("ctrl-alt-s", ToggleAutosave, None),
+            // 录屏：只录本软件窗口那一块画面。`Ctrl+Alt+R` 开始/停止、`Ctrl+Alt+P` 暂停/继续。
+            KeyBinding::new("ctrl-alt-r", ToggleRecording, None),
+            KeyBinding::new("ctrl-alt-p", ToggleRecordPause, None),
             // AI 编辑。Enter/Tab/空格/Esc 只在浮层内生效（按键上下文限定），
             // 否则会把编辑器自己的按键抢走。
             KeyBinding::new("ctrl-k", AiEditOpen, None),

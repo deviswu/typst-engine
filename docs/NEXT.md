@@ -54,9 +54,16 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 | L27 | 磁盘上的**外部改动自动重读**（500 ms 轮询 + 200 ms 防抖，稳定了才读；本地有未保存改动时**一个字都不动**，只在状态栏说一句；只盯主文件，被 `#include` 的那些仍靠 `Ctrl+B`） | ✅ `disk_watch.rs`（纯函数 + 12 个单测）· `main.rs::{spawn_disk_watch,apply_disk_reload}` · `ui.rs`（`window.defer`）· `safe_update.rs::safe_task_read` |
 | L28 | **AI 编辑能用**（用户原话：Ctrl+K 出来的功能不能用）：① 把「端点 / 模型 / Key」搬上界面（AI 菜单 → AI 设置…，之前只能手改 `settings.conf`，而没配 Key 的请求必然 401）② 没配 Key 就不发请求、开浮层就说 ③ 报错带 HTTP 状态码 + 响应原文（之前没 Key 时只报 `expected value at line 1 column 1`）④ `--ai-selftest` 一行命令验证通不通 ⑤ 作用范围扩成**选中文字 / 整篇 / 一个文件**（目录树右键 →「AI 处理…」，可处理没打开的那个文件，不必存盘再换文件） | ✅ `ai_scope.rs`（纯函数 + 3 个单测）· `ai.rs`（错误信息 + 3 个单测）· `main.rs::{open_ai_settings,open_ai_for_file,ai_scope_text,apply_ai,ai_selftest}` · `ui/overlays.rs::render_ai_settings` · `ui/chrome.rs`（AI 菜单）· `ui/panes.rs`（目录树右键） |
 | L29 | AI 交互照 `wu` 的对话框来：**上下文范围**变成一排小按钮（选区 / **光标段落**（上下各 5 行，无选区时的默认）/ 全文 / **插入**），并新增**插入模式**（自取名「插入」：内容插在光标处、原文一个字不动，光标跟到新内容之后；提示词里加了 `INSERT_HINT` 说明「上下文只是位置参照，只准输出新内容」）。同时把应用后的**光标位置**还回去（以前 `set_value` 会把它清成 0，每用一次 AI 光标就跳回第一行），并加了**错位保护**（取上下文的那段文字变了就不应用，不拿旧偏移去拼） | ✅ `ai_scope.rs::{AiScope,ScopeChoice,paragraph_range,line_span,splice_at,landing}`（+12 个单测）· `main.rs::{default_ai_scope,set_ai_scope,ai_scope_choices,install_editor_text,apply_ai}` · `ui/overlays.rs`（按钮行、插入预览、阶段提示）· `ai.rs::INSERT_HINT` |
+| L30 | **录屏**（用户要求）：只录本软件窗口那一块 + 麦克风，可选摄像头画中画；`Ctrl+Alt+R` 起停、`Ctrl+Alt+P` 暂停/继续（暂停 = 分段收尾、继续 = 开新段，停止后 `-c copy` 无损拼接，成品里没有暂停那段）；成品落 `D:\录屏\`；「视图」菜单回来了（L20 删掉的）管三块面板 + 工具栏/状态栏的显隐 —— 录「干净画面」就靠它；新增 `--rec-selftest` 一行命令端到端自检 | ✅ `record.rs`（16 个单测）· `main.rs::{capture_region,start_recording,stop_recording,toggle_record_pause,spawn_rec_poll,finish_recording_on_close}` · `ui/chrome.rs::{render_record_button,render_main_area}` · `settings.rs`（+7 项） |
+| L31 | 用户问「录屏怎么做」时踩到的四条死路，全部实测并记在案：`gdigrab -i title=` **全黑**（window DC 看不到 D3D/DComp 画面）· `ddagrab` 在本机**三块适配器都没有输出**（ToDesk 虚拟显示器）· `Window::render_to_image()` 在 Windows 上**没实现**（`test-support` 桩）· 实时 overlay 合成画中画**时间轴错乱**（摄像头 PTS 与墙钟对不上）。结论：`gdigrab` 区域模式（**物理像素**坐标）+ 分段 + 录完再合成 | ✅ `record.rs` 模块文档（探测结果表）· `docs/FEATURES.md` 第三节（四条「不做」的理由） |：**上下文范围**变成一排小按钮（选区 / **光标段落**（上下各 5 行，无选区时的默认）/ 全文 / **插入**），并新增**插入模式**（自取名「插入」：内容插在光标处、原文一个字不动，光标跟到新内容之后；提示词里加了 `INSERT_HINT` 说明「上下文只是位置参照，只准输出新内容」）。同时把应用后的**光标位置**还回去（以前 `set_value` 会把它清成 0，每用一次 AI 光标就跳回第一行），并加了**错位保护**（取上下文的那段文字变了就不应用，不拿旧偏移去拼） | ✅ `ai_scope.rs::{AiScope,ScopeChoice,paragraph_range,line_span,splice_at,landing}`（+12 个单测）· `main.rs::{default_ai_scope,set_ai_scope,ai_scope_choices,install_editor_text,apply_ai}` · `ui/overlays.rs`（按钮行、插入预览、阶段提示）· `ai.rs::INSERT_HINT` |
 
-- 44 个 commit，8400 行 Rust，**279 个测试全绿**（132 引擎单测 + 6 编译集成 + 7 诊断集成
-  + 12 跳转集成 + 1 性能 + 121 外壳），`cargo fmt --check` 与 `clippy -D warnings` 都干净
+- 45 个 commit，18329 行 Rust（含测试与文档注释；`crates/app` 13167 + `crates/engine` 5162），
+  **295 个测试全绿**（158 引擎：132 单测 + 6 编译集成 + 7 诊断集成 + 12 跳转集成 + 1 性能；
+  137 外壳，其中 16 个是新增的 `record` 单测），`cargo fmt --check` 与 `clippy -D warnings` 都干净
+- 录屏链路的**端到端**验证不走单测（全是外部进程与平台行为）：
+  `cargo run -p typst-live -- --rec-selftest 8` 会开窗、自动录 8 秒（中途暂停 1 秒再继续）、
+  打印成品路径并退出。实测两份成品：无暂停的 6.1s（139 帧 / 217 音频包）、
+  带暂停的 8.03s（**4+4，暂停那 1 秒没进成品**，168 帧 / 262 音频包），两份都全片解码零错误
 - 远端：`github.com/deviswu/typst-engine`（public，`master`，SSH）—— `git push` 即可
 - 依赖只有 crates.io 官方 `typst 0.15.1`，无 git fork（gpui / gpui-component 是 git rev，与 `wu` 同款）
 

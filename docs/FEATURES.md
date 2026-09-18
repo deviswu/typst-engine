@@ -81,8 +81,13 @@
 | 大纲：层级缩进 + 层级配色 + 折叠展开 | 左栏「大纲」：点标题跳转、点 ▾/▸ 折叠 | `ui/panes.rs` |
 | 目录树（后台扫描、空目录给提示） | 左栏；**空状态整块可点 = 扫描当前目录**（否则就先去「文件 → 打开文件夹…」） | `main.rs::refresh_tree` · `ui/panes.rs::render_tree_body` |
 | 右侧多视图（预览 / Markdown / 图片） | 按打开的文件类型自动切 | `markdown_view.rs` / `image_view.rs` |
-| 工具栏（26 按钮 + 9 色下拉，按组分隔） | 顶部第二行 | `markup.rs` |
+| 工具栏（26 按钮 + 9 色下拉，按组分隔；**末尾多一个「录屏」按钮** —— 录制中变红带计时） | 顶部第二行 | `markup.rs` · `ui/chrome.rs::render_record_button` |
 | 交互式终端 | `Ctrl+4` | `terminal.rs` |
+| **录屏**：只录本软件窗口那一块 + 麦克风（不是整屏） | 工具栏「录屏」/ 菜单「视图 → 开始录屏」/ `Ctrl+Alt+R`；成品落 `D:\录屏\typst-live-<年月日-时分秒>.mp4` | `record.rs`（`crop_region` / `screen_args` / `camera_args` / `concat_args` / `overlay_args` 纯函数 + 16 个单测）· `main.rs::{capture_region,start_recording,stop_recording}` |
+| 录屏**暂停 / 继续**（暂停 = 把这一段收干净，继续 = 开新的一段；停止后 `-c copy` 无损拼接 —— 成品里**没有**暂停那段） | 工具栏「⏸ 暂停」/ 菜单「视图 → 暂停录」/ `Ctrl+Alt+P` | `record.rs::{pause,resume}` · `Finalize::run` |
+| 录屏**画中画**（摄像头单独录一路文件，停止后合成到右下角） | 菜单「视图 → 录摄像头画中画」（默认开） | `record.rs::overlay_args` · `nvenc_available` |
+| 录屏自检（一行命令端到端：开窗 → 录 → 中途暂停/继续 → 收尾 → 打印成品路径） | `cargo run -p typst-live -- --rec-selftest 8` | `main.rs::REC_SELFTEST` · `ui.rs`（自测那一段） |
+| 面板与两条栏的显隐（**录「干净画面」靠它**：录出来的画面就是窗口本身） | 菜单「视图 → 显示目录 / 显示编辑区 / 显示展示区 / 显示工具栏 / 显示状态栏」（勾选，随设置持久化；三块面板全关时中间给一句恢复提示） | `ui/chrome.rs::render_main_area` · `main.rs::set_pane_visible` · `settings.rs`（+7 项） |
 | AI 编辑（选中 → `Ctrl+K` → 逐块 diff → 应用） | 菜单「AI」/ `Ctrl+K` | `ai.rs` / `diff.rs` |
 | AI 编辑的**上下文范围**（浮层里一排小按钮，点一下就换） | ① **选区**（有选区时才有这个按钮）② **光标段落**（上下各 5 行，`Ctrl+K` 无选区时的默认）③ **全文** ④ **插入**（上下文也取光标段落，但结果**插在光标处、原文不动**，光标跟到新内容之后） | `ai_scope.rs`（`paragraph_range` / `splice_at` / `landing`，纯函数，15 个单测）· `main.rs::{default_ai_scope,set_ai_scope,ai_scope_text,apply_ai}` · `ui/overlays.rs`（按钮行 + 插入预览） |
 | AI 应用结果时做什么 | 编辑器内（选区/段落/全文/插入）：`set_value` + **把光标放回应在的位置**（否则 gpui-component 会清成 0，每用一次 AI 光标就跳回第一行）→ 置脏 → 重排；文件：写盘 + 源缓存作废 + 重排 | `main.rs::{apply_ai,install_editor_text}` |
@@ -128,6 +133,11 @@
 | fork gpui-component 去改行号列 / 折叠箭头常显 | 收益（几处视觉细节）与代价（从此要跟官方 rebase）不成比例。现在的做法是**只用它的公开钩子**（`lsp.completion_provider` / `document_color_provider` / `set_folding`）。 |
 | 右侧预览换成 SVG 渲染 | 位图纹理路线已经跑通且可控（DPI、惰性出图、双击定位都依赖它），换 SVG 要重做整条预览链。 |
 | 用 `typst_syntax::highlight()` 换掉 tree-sitter 高亮 | 库把高亮焊死在 tree-sitter 上（`LanguageConfig.language` 是硬字段、`SyntaxHighlighter` 是具体结构体），换要 fork。见 `engine/src/syntax/mod.rs` 的模块文档。 |
+| 录屏时录**系统声音** | 用户要的是「录语音」，麦克风已经覆盖；系统声音要走 WASAPI loopback（或虚拟声卡），与「要简单」冲突。 |
+| 多显示器 / 窗口移动跟随 | `gdigrab` 的桌面以**主屏左上角**为原点（副屏坐标是负的），所以只支持主屏；跟随窗口移动要重启 ffmpeg（一次录制会碎成多个文件）。现在的行为是：录制区域固定为「按下开始那一刻的窗口矩形」。 |
+| 用 ffmpeg 原生能力做暂停 | 单进程 ffmpeg 没有原生暂停：`sendcmd` 管不到实时源，挂起进程会把实时时钟搞乱（dshow 的缓冲会溢）。现在是「分段 + `-c copy` 拼接」，实测拼出来全片解码零错误。 |
+| 实时合成画中画（摄像头直接接进 overlay） | 实测会让**时间轴错乱**：195 帧只占 3.56s（放出来是快进），因为 dshow 摄像头的 PTS 与墙钟对不上。所以改成「录完再合成」——文件到文件，时间轴确定，7 秒素材用 nvenc 只要 0.44s。 |
+| 用 `ddagrab`（桌面复制）代替 gdigrab | 理论上更对（GPU 原生、不占 CPU），但**本机跑不了**：装了 ToDesk 虚拟显示器，DXGI 0/1/2 号适配器都没有输出（`Selected output not supported`）。换成没装虚拟显示器的机器可以再评估（`record.rs` 模块文档里记了完整探测结果）。 |
 
 ---
 
