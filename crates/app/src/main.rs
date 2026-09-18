@@ -554,6 +554,16 @@ struct Previewer {
     /// 轮询每 500 ms 一拍，不记着就会把同一句话刷满状态栏；
     /// 情况变了（存了 / 重读成功）就清掉，下次还能再说。
     disk_problem: Option<String>,
+    /// 磁盘上有一份**我们知道、但还没装进编辑器**的版本（指纹）。
+    ///
+    /// 与 `disk_stamp` 的区别：`disk_stamp` 是「磁盘上那一份长什么样」（用来发现
+    /// 变化，也用来判断「这次写盘会不会盖掉别人」）；`disk_conflict` 是「有一份欠着的、
+    /// 还没装」。本地有未保存改动时就欠在这里，等本地变干净（保存 / 撤回原状）再补装。
+    disk_conflict: Option<disk_watch::Stamp>,
+    /// 「点第一下只提示、点第二下才真丢」的待确认打开：路径 + 第一下的时间。
+    pending_open: Option<(PathBuf, Instant)>,
+    /// `Ctrl+S` 已经提示过一次「磁盘上也有新版本」：再按一次就以我为准写盘。
+    force_write_armed: bool,
     /// 焦点在编辑器里吗 —— 外部改动落地时要不要跟着把光标放回去，看它。
     ///
     /// `InputState` 的 `focus_handle` 是 `pub(super)`，外面拿不到，所以走
@@ -703,6 +713,18 @@ struct Previewer {
     rec_selftest: Option<u64>,
     /// 自测已经开过录没有（免得每帧都去开一次）。
     rec_selftest_started: bool,
+    /// `--watch-selftest` 的步进机：走到第几步（`None` = 不在自测）。
+    watch_step: Option<u32>,
+    /// 下一步什么时候做。
+    watch_next_at: Instant,
+    /// 自测里「编辑器里那份」（弄脏之后）。
+    watch_dirty_text: String,
+    /// 自测里「外部写进去那份」。
+    watch_external_text: String,
+    /// 自测中间几个断言的结果。
+    watch_ok_notice: bool,
+    watch_ok_disk: bool,
+    watch_ok_prompt: bool,
     /// 主题名（「视图 → 主题」里勾选的那一个）。
     /// 状态栏那个下拉框已经搬进菜单，所以这里只留名字。
     /// 本文档定义的名字（`#let` / `#import`）—— 补全候选的一路来源。
@@ -973,6 +995,9 @@ impl Previewer {
             disk_polling: false,
             disk_reloads: 0,
             disk_problem: None,
+            disk_conflict: None,
+            pending_open: None,
+            force_write_armed: false,
             editor_focused: true,
             close_prompt: false,
             close_confirmed: false,
@@ -1035,6 +1060,13 @@ impl Previewer {
             rec_cam_device: None,
             rec_selftest,
             rec_selftest_started: false,
+            watch_step: WATCH_SELFTEST.load(Ordering::Relaxed).then_some(0),
+            watch_next_at: Instant::now() + Duration::from_millis(1500),
+            watch_dirty_text: String::new(),
+            watch_external_text: String::new(),
+            watch_ok_notice: false,
+            watch_ok_disk: false,
+            watch_ok_prompt: false,
             theme_name,
             local_defs,
             marks,
@@ -1064,6 +1096,25 @@ impl Previewer {
             this.spawn_terminal_pump(term, cx);
         }
 
+        // `--watch-selftest` 靠 `render` 里的步进机走，而 render 只在有事件时才跑
+        // —— 所以得有个小任务每 200ms 推一帧（在 render 里自救不了，见 NEXT.md 那条坑）。
+        if this.watch_step.is_some() {
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(200))
+                        .await;
+                    match safe_task_update(&this, cx, |this, cx| {
+                        this.watch_step.is_some().then(|| cx.notify())
+                    }) {
+                        UpdateOutcome::Done(Some(())) | UpdateOutcome::Busy => {}
+                        UpdateOutcome::Done(None) | UpdateOutcome::Gone => break,
+                    }
+                }
+            })
+            .detach();
+        }
+
         // **不在这里编译**：45 页冷编译 200+ ms，同步做的话窗口要等它排完
         // 才出现。推迟到第一帧画完（见 `render` 里的 `first_compile`）。
         this
@@ -1079,7 +1130,16 @@ impl Previewer {
         if text == self.last_text {
             return;
         }
+        // 「文本变了」的记法走 `mark_edited`（置脏 + 给自动保存上闹钟）。
+        //
+        // ★ 但 `dirty` 的最后取值必须用**事实**算，而不是「只要变过就一直脏」：
+        // 撤销回原状（或 AI 应用后又撤掉）之后，文本已经与磁盘一致了，
+        // 而自动保存用的是 `text != saved_text` 这个事实 —— 它不写盘，`dirty`
+        // 就**永远卡在 true**：点目录树里的文件一直被拒、磁盘上的改动一直被
+        // 当成「本地更新」。（实测日志里的形状：自动保存停在某一刻，之后一直是
+        // 「拒绝打开 x.typ：当前文档有未保存的修改」。）
         self.mark_edited(cx);
+        self.dirty = text != self.saved_text;
         self.recompile_text(text, cx);
     }
 
@@ -1349,7 +1409,9 @@ impl Previewer {
 
     /// Ctrl+S：把编辑器里的文本写到 `main_path`。
     fn save_file(&mut self, cx: &mut Context<Self>) {
-        if self.write_to_disk(cx) {
+        // 上一次 Ctrl+S 提示过「磁盘上也有新版本」→ 这一次就是明说的「以我为准」。
+        let force = std::mem::take(&mut self.force_write_armed);
+        if self.write_to_disk(force, cx) {
             self.message = Some(format!("已保存 {}", self.main_path.display()));
         }
         cx.notify();
@@ -1362,8 +1424,28 @@ impl Previewer {
     ///
     /// 返回写成功了没有。失败时把原因写进 `message`（状态栏那一行是用户
     /// 唯一能看到的地方），但**不动 `dirty`** —— 没写下去就是没写下去。
-    fn write_to_disk(&mut self, cx: &mut Context<Self>) -> bool {
+    fn write_to_disk(&mut self, force: bool, cx: &mut Context<Self>) -> bool {
         let text = self.editor.read(cx).value().to_string();
+
+        // ★ 写之前先看一眼磁盘：那一份还是我们记着的那一份吗？不是（另一个编辑器 /
+        // agent / 脚本动过）就**不静默覆盖** —— 这是全项目唯一会毁掉别人成果的
+        // 地方。`force` = 用户按了第二次 Ctrl+S，明确说「以我为准」。
+        let on_disk = disk_watch::Stamp::of(&self.main_path);
+        if !disk_watch::may_overwrite(self.disk_stamp, on_disk, force) {
+            self.disk_conflict = on_disk;
+            self.force_write_armed = true;
+            self.message = Some(format!(
+                "「{}」在磁盘上也被改过：再按一次 Ctrl+S = 以你为准写盘；或点目录树里这个文件 = 丢掉本地改动、加载磁盘那份",
+                short_label(&self.main_path)
+            ));
+            logln!(
+                "[typst-live] 不覆盖：{} 在磁盘上被外部改过（Ctrl+S 再按一次 = 以我为准）",
+                short_label(&self.main_path)
+            );
+            cx.notify();
+            return false;
+        }
+        self.force_write_armed = false;
 
         match std::fs::write(&self.main_path, &text) {
             Ok(()) => {
@@ -1379,6 +1461,8 @@ impl Previewer {
                 // 与「磁盘上有新版本，没有重载」那句提示到此为止：
                 // 现在磁盘与编辑器一致了（一致到我们这一侧）。
                 self.disk_problem = None;
+                // 写成了：以我为准（或本来就没冲突）——「磁盘上那份还没装」到此作废。
+                self.disk_conflict = None;
                 // 关窗浮层还开着的话，它现在说的「有未保存的改动」已经不成立了：
                 // 收掉它（用户想关再点一次 × 就行）。留着比收掉更误导。
                 self.close_prompt = false;
@@ -1423,13 +1507,23 @@ impl Previewer {
             return;
         }
 
+        // 磁盘上有一份我们知道、还没装的版本：自动保存**不覆盖**它 ——
+        // 「谁赢」得由用户在 Ctrl+S 那一下决定，不能让一个一秒后的定时器替他决定。
+        if self.disk_conflict.is_some() {
+            self.note(
+                "磁盘上也有新版本：自动保存先停着（Ctrl+S 再按一次 = 以你为准；点目录树里的文件 = 加载磁盘那份）".into(),
+                cx,
+            );
+            return;
+        }
+
         let text = self.editor.read(cx).value().to_string();
         let changed = text != self.saved_text;
         if !autosave::should_save(self.autosave, self.explicit_file, changed) {
             return;
         }
 
-        if self.write_to_disk(cx) {
+        if self.write_to_disk(false, cx) {
             self.autosave_writes += 1;
             self.message = Some(format!("已自动保存（第 {} 次）", self.autosave_writes));
             logln!(
@@ -1486,6 +1580,49 @@ impl Previewer {
             loop {
                 cx.background_executor().timer(disk_watch::POLL).await;
 
+                // ⓪ 手上还欠着一份「磁盘上有、我们没装」的版本？
+                //    本地一旦变干净（保存了 / 撤回到原状了）就把它装上。
+                //    这一步放在指纹比较**之前**：这一拍要做的不是「发现变化」，
+                //    而是「把已经知道的那一份装上」。
+                let pending = match safe_task_read(&weak, cx, |this, _| {
+                    (this.explicit_file && this.disk_conflict.is_some() && !this.dirty)
+                        .then(|| this.main_path.clone())
+                }) {
+                    UpdateOutcome::Done(Some(path)) => Some(path),
+                    UpdateOutcome::Done(None) | UpdateOutcome::Busy => None,
+                    UpdateOutcome::Gone => break,
+                };
+                if let Some(path) = pending {
+                    let probe = path.clone();
+                    let (text, stamp) = cx
+                        .background_executor()
+                        .spawn(async move {
+                            (
+                                std::fs::read_to_string(&probe).ok(),
+                                disk_watch::Stamp::of(&probe),
+                            )
+                        })
+                        .await;
+                    let _ = safe_task_update(&weak, cx, |this, cx| {
+                        this.disk_conflict = None;
+                        match (text, stamp) {
+                            (Some(text), Some(stamp)) => {
+                                logln!(
+                                    "[typst-live] 本地已干净 → 补装磁盘上的「{}」",
+                                    short_label(&path)
+                                );
+                                this.pending_reload = Some((text, stamp));
+                            }
+                            _ => this.note(
+                                format!("磁盘上的「{}」读不了，这次补装跳过", short_label(&path)),
+                                cx,
+                            ),
+                        }
+                        cx.notify();
+                    });
+                    continue;
+                }
+
                 // ① 盯的是哪个文件、我们记着磁盘上是什么样。
                 //    内置示例文档（`explicit_file == false`）不走这条路。
                 let watched = match safe_task_read(&weak, cx, |this, _| {
@@ -1516,7 +1653,10 @@ impl Previewer {
                 let Some(now) = now else {
                     let _ = safe_task_update(&weak, cx, |this, cx| {
                         this.note_disk_problem(
-                            format!("「{}」在磁盘上不见了（编辑器里的内容没动）", short_label(&path)),
+                            format!(
+                                "「{}」在磁盘上不见了（编辑器里的内容没动）",
+                                short_label(&path)
+                            ),
                             None,
                             cx,
                         );
@@ -1559,14 +1699,7 @@ impl Previewer {
                     UpdateOutcome::Done(disk_watch::Verdict::Reload) => {}
                     UpdateOutcome::Done(_) => {
                         let _ = safe_task_update(&weak, cx, |this, cx| {
-                            this.note_disk_problem(
-                                format!(
-                                    "「{}」在磁盘上被改过 —— 你有未保存的修改，没有重载（保存后以你为准）",
-                                    short_label(&path)
-                                ),
-                                Some(stamp),
-                                cx,
-                            );
+                            this.note_disk_conflict(&path, stamp, cx);
                         });
                         continue;
                     }
@@ -1586,6 +1719,7 @@ impl Previewer {
                         //    这里没有。挂在 `pending_reload` 上，下一帧 `render` 里装。
                         let _ = safe_task_update(&weak, cx, |this, cx| {
                             this.disk_stamp = Some(stamp);
+                            this.disk_conflict = None;
                             this.pending_reload = Some((text, stamp));
                             cx.notify();
                         });
@@ -1626,6 +1760,11 @@ impl Previewer {
         cx: &mut Context<Self>,
     ) {
         self.disk_stamp = stamp;
+        self.note(problem, cx);
+    }
+
+    /// 只说一句话（去重、进状态栏与日志），**不碰指纹**。
+    fn note(&mut self, problem: String, cx: &mut Context<Self>) {
         if self.disk_problem.as_deref() == Some(problem.as_str()) {
             return;
         }
@@ -1633,6 +1772,28 @@ impl Previewer {
         self.disk_problem = Some(problem.clone());
         self.message = Some(problem);
         cx.notify();
+    }
+
+    /// 磁盘上有新版本、但编辑器里也有未保存改动：**两边都留着**。
+    ///
+    /// 不像以前那样「把指纹记下来就算了」（那等于把这次改动**消费掉**：等你
+    /// 保存完、本地变干净之后也不会再装）。现在欠在 `disk_conflict` 里，
+    /// 轮询一旦看到本地变干净就补装（见 `spawn_disk_watch` 的 ⓪）。
+    fn note_disk_conflict(
+        &mut self,
+        path: &Path,
+        stamp: disk_watch::Stamp,
+        cx: &mut Context<Self>,
+    ) {
+        self.disk_stamp = Some(stamp); // 别重复发现同一次改动
+        self.disk_conflict = Some(stamp); // 但记着「这份还没装」
+        self.note(
+            format!(
+                "「{}」在磁盘上被改过 —— 编辑器里有未保存的改动，先两边都留着（保存或撤到原状后会自动加载；点目录树里这个文件 = 立刻丢掉本地改动加载）",
+                short_label(path)
+            ),
+            cx,
+        );
     }
 
     /// 把磁盘上的新版本装进编辑器。
@@ -1702,6 +1863,9 @@ impl Previewer {
 
         self.dirty = false;
         self.disk_stamp = Some(stamp);
+        // 装上之后：欠着的那份没有了，「Ctrl+S 再按一次」的待命状态也清掉。
+        self.disk_conflict = None;
+        self.force_write_armed = false;
         self.disk_problem = None;
         self.disk_reloads += 1;
         self.recompile(cx);
@@ -1982,13 +2146,123 @@ impl Previewer {
         cx.notify();
     }
 
-    /// `--rec-selftest` 的收尾：打印一句然后退出（不在自测里就什么都不做）。
+    /// `--watch-selftest` 的收尾：打印一句然后退出（不在自测里就什么都不做）。
     fn selftest_report(&mut self, text: &str, cx: &mut Context<Self>) {
         if self.rec_selftest.take().is_none() {
             return;
         }
         println!("[rec-selftest] {text}");
         cx.quit();
+    }
+
+    /// `--watch-selftest` 的步进机。全程走真实代码路径（不注入键盘鼠标），验收三件事：
+    /// ① 本地有未保存改动 + 磁盘也被改了 → **两边都留着**，不静默覆盖；
+    /// ② 点目录树里的文件第一下只提示；③ 第二下真的从磁盘重新加载。
+    fn watch_selftest_step(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let step = self.watch_step.unwrap_or(0);
+        self.watch_step = Some(step + 1);
+        // 头两步之后要留够时间：轮询（500ms）+ 防抖（200ms）+ 自动保存那一拍（1s）
+        self.watch_next_at = Instant::now()
+            + Duration::from_millis(match step {
+                0 | 1 => 2600,
+                _ => 500,
+            });
+
+        match step {
+            0 => {
+                // ① 弄脏：等价于「用户刚在编辑器里敲了字」，但不过键盘
+                let before = self.editor.read(cx).value().to_string();
+                self.saved_text = before.clone();
+                let after = format!("{before}\n// watch-selftest：让编辑器变脏的一行\n");
+                self.editor
+                    .update(cx, |state, cx| state.set_value(after.clone(), window, cx));
+                self.mark_edited(cx);
+                self.dirty = true;
+                self.watch_dirty_text = after;
+                logln!("[watch-selftest] ① 编辑器已变脏（本地有未保存改动）");
+            }
+            1 => {
+                // ② 先把「本地又改了」做实（同时给自动保存重新上闹钟），紧接着外部改写。
+                //    于是 1 秒后那一拍自动保存必然撞上「磁盘已变」—— 验的就是它会不会
+                //    静静地把外部那份盖掉。
+                let before = self.editor.read(cx).value().to_string();
+                let after = format!("{before}\n// watch-selftest：本地又加的一行\n");
+                self.editor
+                    .update(cx, |state, cx| state.set_value(after.clone(), window, cx));
+                self.mark_edited(cx);
+                self.dirty = true;
+                self.watch_dirty_text = after.clone();
+
+                let external = format!("{after}\n外部改的一行：这一行来自「终端」\n");
+                let target = self.main_path.clone();
+                match std::fs::write(&target, &external) {
+                    Ok(()) => logln!("[watch-selftest] ② 外部已改写 {}", short_label(&target)),
+                    Err(err) => logln!("[watch-selftest] ② 外部改写失败：{err}"),
+                }
+                self.watch_external_text = external;
+            }
+            2 => {
+                // ③ 期望：本地改动保住、磁盘上那份**没被自动保存盖掉**、提示到位、
+                //    并且记着「磁盘上还有一份没装」。
+                let text = self.editor.read(cx).value().to_string();
+                let kept_local = text == self.watch_dirty_text;
+                let on_disk = std::fs::read_to_string(&self.main_path).unwrap_or_default();
+                let external_survived = on_disk == self.watch_external_text;
+                let message = self.message.clone().unwrap_or_default();
+                let noticed = self.disk_conflict.is_some() && message.contains("磁盘");
+                self.watch_ok_notice = kept_local && noticed;
+                self.watch_ok_disk = external_survived;
+                logln!(
+                    "[watch-selftest] ③ 本地改动保住={kept_local} 磁盘上那份额还是它={external_survived} 提示到位={noticed} 欠着磁盘新版={} 状态栏=\"{message}\"",
+                    self.disk_conflict.is_some()
+                );
+            }
+            3 => {
+                // ④ 点目录树里的这个文件（第一下）：只该提示，什么都不该动
+                let path = self.main_path.clone();
+                self.open_path(path, window, cx);
+                let message = self.message.clone().unwrap_or_default();
+                self.watch_ok_prompt = message.contains("再点一次");
+                logln!("[watch-selftest] ④ 第一下点文件 → 状态栏：{message}");
+            }
+            _ => {
+                // ⑤ 再点一下：该真的从磁盘重载
+                let path = self.main_path.clone();
+                self.open_path(path, window, cx);
+                let text = self.editor.read(cx).value().to_string();
+                let loaded = text == self.watch_external_text;
+                let verdict = |ok: bool| if ok { "通过" } else { "**失败**" };
+                println!(
+                    "[watch-selftest] ① 本地改动保住 + 提示磁盘被改：{}",
+                    verdict(self.watch_ok_notice)
+                );
+                println!(
+                    "[watch-selftest] ② 自动保存没把磁盘上那份盖掉（不静默覆盖）：{}",
+                    verdict(self.watch_ok_disk)
+                );
+                println!(
+                    "[watch-selftest] ③ 第一下点只提示：{}",
+                    verdict(self.watch_ok_prompt)
+                );
+                println!(
+                    "[watch-selftest] ④ 第二下点加载了磁盘新版（dirty={}）：{}",
+                    self.dirty,
+                    verdict(loaded)
+                );
+                println!(
+                    "[watch-selftest] 结论：{}",
+                    if self.watch_ok_notice && self.watch_ok_disk && self.watch_ok_prompt && loaded
+                    {
+                        "全部通过"
+                    } else {
+                        "**有失败**"
+                    }
+                );
+                self.watch_step = None;
+                cx.quit();
+            }
+        }
+        cx.notify();
     }
 
     /// 暂停 / 继续。
@@ -3200,6 +3474,10 @@ impl Previewer {
         // 上一个文件留下的待装文本 / 提示，跟着一起清掉。
         self.pending_reload = None;
         self.disk_problem = None;
+        // 换文件了：上一份文件欠着的「磁盘新版」与「待确认打开」都跟着作废。
+        self.disk_conflict = None;
+        self.pending_open = None;
+        self.force_write_armed = false;
         self.right = RightPane::Preview;
 
         self.editor.update(cx, |state, cx| {
@@ -3262,12 +3540,45 @@ impl Previewer {
         .detach();
     }
 
-    /// 打开一个文件（目录树点击走这里）：按类型决定显示到哪里。
+    /// 打开一个文件（目录树里点一下、或最近文件夹）：按类型决定显示到哪里
+    /// （图片 → 图片视图；`.md` → Markdown 渲染；其它文本 → 编辑器）。
     ///
-    /// - 图片 → 右侧图片视图
-    /// - `.md` → 右侧 Markdown 渲染（**可选中可复制**，位图预览做不到）
-    /// - 其它文本 → 编辑器（右侧回到排版预览）
+    /// **本地有未保存改动时不再直接拒绝**：第一下只提示，第二下（8 秒内再点同一个
+    /// 文件）就丢掉编辑器里那份、从磁盘重新读。理由：在终端里用 agent 改完文件、
+    /// 回 app 里点一下就能看到 —— 那一下不能是个死胡同（实测用户被拒了 23 次）。
     fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dirty
+            && !disk_watch::within_confirm_window(
+                self.pending_open.as_ref().map(|(p, at)| (p.as_path(), *at)),
+                &path,
+                Instant::now(),
+            )
+        {
+            let same_file = path == self.main_path;
+            self.pending_open = Some((path.clone(), Instant::now()));
+            self.message = Some(if same_file {
+                format!(
+                    "「{}」编辑器里有未保存的改动：再点一次 = 丢掉它们，重新从磁盘加载",
+                    short_label(&path)
+                )
+            } else {
+                format!(
+                    "当前文档有未保存的改动：再点一次「{}」= 丢掉它们并切过去",
+                    short_label(&path)
+                )
+            });
+            logln!(
+                "[typst-live] 待确认打开 {}：当前文档有未保存的改动（再点一次就丢改动重载）",
+                short_label(&path)
+            );
+            cx.notify();
+            return;
+        }
+        self.pending_open = None;
+        // 走到这儿就说明用户确认过了（或本来就不脏）：编辑器里那份就是要丢掉的那份。
+        // （置成干净才能过 `open_in_editor` 那道闸 —— 它仍然是最后一道保险。）
+        self.dirty = false;
+
         if image_view::is_image_path(&path) {
             self.image = Some(cx.new(|cx| ImageView::new(path.clone(), cx)));
             self.right = RightPane::Image;
@@ -3488,6 +3799,9 @@ fn ai_selftest(insert: bool) -> i32 {
 /// `--rec-selftest` 要录多少秒（0 = 不是自测）。
 static REC_SELFTEST: AtomicU64 = AtomicU64::new(0);
 
+/// `--watch-selftest`：验「外部改了文件，编辑器跟不跟」那一整套。
+static WATCH_SELFTEST: AtomicBool = AtomicBool::new(false);
+
 fn main() {
     // 崩溃也要留痕：发布版是 GUI 子系统，stderr 没人接得住（见 `diag` 模块）。
     diag::install_panic_hook();
@@ -3506,6 +3820,31 @@ fn main() {
             .unwrap_or(5);
         REC_SELFTEST.store(secs, Ordering::Relaxed);
         path_arg = None;
+    }
+
+    // `--watch-selftest <文件>`：验收「终端里改了文件 → 编辑器跟不跟」。
+    //
+    // 剧本里要**模拟外部改写**，所以它真的会动那个文件 —— 只接受 tmp/ 或系统临时
+    // 目录下的文件，免得有人对着自己的笔记跑一遍把稿子改了。
+    if path_arg.as_deref() == Some("--watch-selftest") {
+        let Some(target) = std::env::args().nth(2) else {
+            eprintln!("用法：typst-live --watch-selftest <tmp 下的 .typ 文件>");
+            std::process::exit(2);
+        };
+        let path = PathBuf::from(&target);
+        // 路径里只要有叫 `tmp` 的一段就放行（相对、绝对、大小写都能应付）
+        let under_tmp = path.starts_with(std::env::temp_dir())
+            || path
+                .components()
+                .any(|c| c.as_os_str().eq_ignore_ascii_case("tmp"));
+        if !under_tmp {
+            eprintln!(
+                "[watch-selftest] 拒跑：这个自测会改写目标文件，只接受 tmp/ 或系统临时目录下的文件（给的是 {target}）"
+            );
+            std::process::exit(2);
+        }
+        WATCH_SELFTEST.store(true, Ordering::Relaxed);
+        path_arg = Some(target);
     }
 
     // `--ai-selftest`：不开窗，真发一次最小的请求，把结果打在终端上。

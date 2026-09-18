@@ -56,10 +56,15 @@ cargo run --example realtime    # 终端的逐字输入性能数据
 | L29 | AI 交互照 `wu` 的对话框来：**上下文范围**变成一排小按钮（选区 / **光标段落**（上下各 5 行，无选区时的默认）/ 全文 / **插入**），并新增**插入模式**（自取名「插入」：内容插在光标处、原文一个字不动，光标跟到新内容之后；提示词里加了 `INSERT_HINT` 说明「上下文只是位置参照，只准输出新内容」）。同时把应用后的**光标位置**还回去（以前 `set_value` 会把它清成 0，每用一次 AI 光标就跳回第一行），并加了**错位保护**（取上下文的那段文字变了就不应用，不拿旧偏移去拼） | ✅ `ai_scope.rs::{AiScope,ScopeChoice,paragraph_range,line_span,splice_at,landing}`（+12 个单测）· `main.rs::{default_ai_scope,set_ai_scope,ai_scope_choices,install_editor_text,apply_ai}` · `ui/overlays.rs`（按钮行、插入预览、阶段提示）· `ai.rs::INSERT_HINT` |
 | L30 | **录屏**（用户要求）：只录本软件窗口那一块 + 麦克风，可选摄像头画中画；`Ctrl+Alt+R` 起停、`Ctrl+Alt+P` 暂停/继续（暂停 = 分段收尾、继续 = 开新段，停止后 `-c copy` 无损拼接，成品里没有暂停那段）；成品落 `D:\录屏\`；「视图」菜单回来了（L20 删掉的）管三块面板 + 工具栏/状态栏的显隐 —— 录「干净画面」就靠它；新增 `--rec-selftest` 一行命令端到端自检 | ✅ `record.rs`（16 个单测）· `main.rs::{capture_region,start_recording,stop_recording,toggle_record_pause,spawn_rec_poll,finish_recording_on_close}` · `ui/chrome.rs::{render_record_button,render_main_area}` · `settings.rs`（+7 项） |
 | L31 | 用户问「录屏怎么做」时踩到的四条死路，全部实测并记在案：`gdigrab -i title=` **全黑**（window DC 看不到 D3D/DComp 画面）· `ddagrab` 在本机**三块适配器都没有输出**（ToDesk 虚拟显示器）· `Window::render_to_image()` 在 Windows 上**没实现**（`test-support` 桩）· 实时 overlay 合成画中画**时间轴错乱**（摄像头 PTS 与墙钟对不上）。结论：`gdigrab` 区域模式（**物理像素**坐标）+ 分段 + 录完再合成 | ✅ `record.rs` 模块文档（探测结果表）· `docs/FEATURES.md` 第三节（四条「不做」的理由） |：**上下文范围**变成一排小按钮（选区 / **光标段落**（上下各 5 行，无选区时的默认）/ 全文 / **插入**），并新增**插入模式**（自取名「插入」：内容插在光标处、原文一个字不动，光标跟到新内容之后；提示词里加了 `INSERT_HINT` 说明「上下文只是位置参照，只准输出新内容」）。同时把应用后的**光标位置**还回去（以前 `set_value` 会把它清成 0，每用一次 AI 光标就跳回第一行），并加了**错位保护**（取上下文的那段文字变了就不应用，不拿旧偏移去拼） | ✅ `ai_scope.rs::{AiScope,ScopeChoice,paragraph_range,line_span,splice_at,landing}`（+12 个单测）· `main.rs::{default_ai_scope,set_ai_scope,ai_scope_choices,install_editor_text,apply_ai}` · `ui/overlays.rs`（按钮行、插入预览、阶段提示）· `ai.rs::INSERT_HINT` |
+| L32 | **修「agent 改了文件，app 不跟着变」**（用户报的）：根因不是「不加载」，而是四条什么都不做的路 ——① 编辑器 `dirty` **卡住**（撤销回原状后标志位不清、自动保存又判定「没变化」，实测自动保存停在第 165 次之后全是「拒绝打开」）② 点目录树里的文件被**无提示拒绝**（实测 23 次）③ 「本地脏 + 磁盘也变」时把改动**消费掉**（指纹记下了事，之后再也不装）④ 写盘（`Ctrl+S` / 自动保存）会**静默盖掉**外部那份。修法：`dirty` 用事实算（撤销回原状就干净）；点文件 = 从磁盘重读（脏时第一下提示、第二下确认）；「本地脏 + 磁盘变」改成**两边都留着**并在本地变干净后补装；写盘前比指纹 —— 磁盘被外部改过就不静默写（`Ctrl+S` 再按一次 = 以我为准）。新增 `--watch-selftest` 验收这四条 | ✅ `disk_watch::{may_overwrite,within_confirm_window}`（+3 单测）· `main.rs::{on_editor_change,open_path,write_to_disk,save_file,autosave_now,note_disk_conflict,spawn_disk_watch ⓪,watch_selftest_step}` |
 
-- 45 个 commit，18329 行 Rust（含测试与文档注释；`crates/app` 13167 + `crates/engine` 5162），
-  **295 个测试全绿**（158 引擎：132 单测 + 6 编译集成 + 7 诊断集成 + 12 跳转集成 + 1 性能；
-  137 外壳，其中 16 个是新增的 `record` 单测），`cargo fmt --check` 与 `clippy -D warnings` 都干净
+- 47 个 commit，18739 行 Rust（含测试与文档注释；`crates/app` 13577 + `crates/engine` 5162），
+  **298 个测试全绿**（158 引擎：132 单测 + 6 编译集成 + 7 诊断集成 + 12 跳转集成 + 1 性能；
+  140 外壳，其中 16 个是 `record`、3 个是这次新加的 `disk_watch` 单测），`cargo fmt --check` 与 `clippy -D warnings` 都干净
+- 「外部改了文件跟不跟」那套也用 `--watch-selftest` 端到端验（走真实代码路径，不注入键盘鼠标）：
+  `cargo run -p typst-live -- --watch-selftest tmp/x.typ` → 四条断言全通过（本地改动保住 / 磁盘上那份
+  没被自动保存盖掉 / 第一下点只提示 / 第二下点加载了磁盘新版）；另外五种外部写盘方式
+  （普通写、同长度写、原子写 tmp+rename、先删再建、连续快改）在编辑器干净时也逐一验过会自动重读
 - 录屏链路的**端到端**验证不走单测（全是外部进程与平台行为）：
   `cargo run -p typst-live -- --rec-selftest 8` 会开窗、自动录 8 秒（中途暂停 1 秒再继续）、
   打印成品路径并退出。实测两份成品：无暂停的 6.1s（139 帧 / 217 音频包）、

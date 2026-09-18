@@ -74,6 +74,12 @@ impl Render for Previewer {
             .detach();
         }
 
+        // `--watch-selftest`：到点就走一步。它要 `&mut Window`（`set_value` /
+        // `open_path` 都要），所以只能在这里推。平时走不到这儿。
+        if self.watch_step.is_some() && Instant::now() >= self.watch_next_at {
+            self.watch_selftest_step(window, cx);
+        }
+
         // 窗口尺寸/位置变了就记下来（拖动时会变很多次，所以写盘是防抖的）。
         //
         // ★ 用 `window_bounds()` 而不是 `bounds()`：前者就是「下次开窗该用哪份

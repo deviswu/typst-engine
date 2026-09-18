@@ -9,7 +9,7 @@
 //! 所以「该不该重读」是个纯函数，每条分支都有单测钉住。
 
 use std::path::Path;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 /// 多久查一次。
 ///
@@ -71,6 +71,29 @@ pub fn changed(known: Option<Stamp>, now: Option<Stamp>) -> bool {
         (None, None) => false,
         _ => true,
     }
+}
+
+/// 点第二次确认的有效期。
+///
+/// 「点目录树里的文件 = 从磁盘重新加载」：本地有未保存改动时，**第一下只提示、
+/// 第二下才真丢**。太短来不及点第二下，太长会让「几分钟前点过」变成一次误丢。
+pub const CONFIRM_WINDOW: Duration = Duration::from_secs(8);
+
+/// 这次点击算不算「第二下确认」（同一个路径，且在有效期内）。
+pub fn within_confirm_window(pending: Option<(&Path, Instant)>, path: &Path, now: Instant) -> bool {
+    let Some((pending_path, at)) = pending else {
+        return false;
+    };
+    pending_path == path && now.saturating_duration_since(at) <= CONFIRM_WINDOW
+}
+
+/// 写盘前该不该动手。
+///
+/// 这是本项目**唯一**会毁掉别人（另一个编辑器 / agent / 脚本）成果的地方，
+/// 所以「磁盘上那一份被外部改过就不静默写」这条必须挡在这儿。
+/// `force` 是用户显式说的「以我为准」（`Ctrl+S` 再按一次）：只有那时才允许覆盖。
+pub fn may_overwrite(known: Option<Stamp>, on_disk: Option<Stamp>, force: bool) -> bool {
+    force || !changed(known, on_disk)
 }
 
 /// 检测到磁盘变了之后该怎么办。
@@ -200,6 +223,48 @@ mod tests {
     #[test]
     fn missing_file_has_no_stamp() {
         assert!(Stamp::of(Path::new("no/such/dir/nope.typ")).is_none());
+    }
+
+    #[test]
+    fn overwrite_is_allowed_only_when_the_disk_is_unchanged() {
+        // 磁盘还是我们记着那一份：照写（这是日常保存）
+        assert!(may_overwrite(Some(stamp(10, 5)), Some(stamp(10, 5)), false));
+        // 磁盘被别人改过：不写（不能把别人的成果盖掉）
+        assert!(!may_overwrite(
+            Some(stamp(10, 5)),
+            Some(stamp(11, 9)),
+            false
+        ));
+        // 但用户说了「以我为准」：写
+        assert!(may_overwrite(Some(stamp(10, 5)), Some(stamp(11, 9)), true));
+    }
+
+    #[test]
+    fn overwrite_handles_the_new_file_cases() {
+        // 文档在磁盘上还不存在，现在也不存在：正常第一次保存
+        assert!(may_overwrite(None, None, false));
+        // 我们从「不存在」开始编辑，中途别人创建了它：不静默盖掉别人的文件
+        assert!(!may_overwrite(None, Some(stamp(3, 3)), false));
+        // 文件被删了（我们编辑时它还在）：也算外部改动，别默默重建
+        assert!(!may_overwrite(Some(stamp(10, 5)), None, false));
+        assert!(may_overwrite(Some(stamp(10, 5)), None, true));
+    }
+
+    #[test]
+    fn confirm_window_needs_the_same_path_in_time() {
+        let now = Instant::now();
+        let path = Path::new("D:/notes/a.typ");
+        let other = Path::new("D:/notes/b.typ");
+
+        // 没点过第一下
+        assert!(!within_confirm_window(None, path, now));
+        // 刚点过同一个文件：算第二下
+        assert!(within_confirm_window(Some((path, now)), path, now));
+        // 换了另一个文件：不算（得重新点两下）
+        assert!(!within_confirm_window(Some((path, now)), other, now));
+        // 超过有效期：不算
+        let late = now + CONFIRM_WINDOW + Duration::from_millis(1);
+        assert!(!within_confirm_window(Some((path, now)), path, late));
     }
 
     #[test]
